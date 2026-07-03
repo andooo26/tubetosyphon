@@ -113,6 +113,15 @@ export default function App() {
       `(()=>{const v=document.querySelector('video');if(v)v.currentTime=${t};})()`,
     );
 
+  // Jump relative to the current position, clamped to [0, duration]. Optimistic
+  // local update so the UI reacts instantly before the next poll.
+  const skip = (delta: number) => {
+    const dur = video.duration || 0;
+    const next = Math.min(Math.max(video.time + delta, 0), dur || Infinity);
+    setVideo((v) => ({ ...v, time: next }));
+    seekTo(next);
+  };
+
   const displayTime = scrub != null ? scrub : video.time;
 
   const play = () => {
@@ -209,6 +218,19 @@ export default function App() {
       </div>
 
       <footer className="transport">
+        <button className="skip" onClick={() => skip(-3)} disabled={!loadedUrl}>
+          -3s
+        </button>
+        <button className="skip" onClick={() => skip(-1)} disabled={!loadedUrl}>
+          -1s
+        </button>
+        <button
+          className="skip"
+          onClick={() => skip(-0.5)}
+          disabled={!loadedUrl}
+        >
+          -0.5s
+        </button>
         <button
           className="playpause"
           onClick={togglePlay}
@@ -216,6 +238,15 @@ export default function App() {
           title={video.paused ? 'Play' : 'Pause'}
         >
           {video.paused ? '▶' : '❚❚'}
+        </button>
+        <button className="skip" onClick={() => skip(0.5)} disabled={!loadedUrl}>
+          +0.5s
+        </button>
+        <button className="skip" onClick={() => skip(1)} disabled={!loadedUrl}>
+          +1s
+        </button>
+        <button className="skip" onClick={() => skip(3)} disabled={!loadedUrl}>
+          +3s
         </button>
         <span className="time">{fmtTime(displayTime)}</span>
         <input

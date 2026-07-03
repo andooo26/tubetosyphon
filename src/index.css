@@ -153,6 +153,12 @@ button.danger {
   line-height: 1;
 }
 
+.transport .skip {
+  padding: 8px 8px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .transport .time {
   font-variant-numeric: tabular-nums;
   font-size: 12px;
