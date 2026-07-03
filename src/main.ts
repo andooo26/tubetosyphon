@@ -127,6 +127,26 @@ const AD_SKIP_JS = `
       // Dismiss "are you still watching" / survey dialogs.
       var dsm = document.querySelector('#dismiss-button button, .ytp-ad-overlay-close-button');
       if (dsm) dsm.click();
+      // Turn subtitles/captions OFF by default (re-asserted every tick since
+      // YouTube may re-enable them on navigation / autoplay).
+      try {
+        var mp = document.getElementById('movie_player');
+        if (mp && mp.setOption) mp.setOption('captions', 'track', {});
+        if (mp && mp.unloadModule) mp.unloadModule('captions');
+      } catch (e) {}
+      // Force the highest available playback quality. YouTube may downgrade on
+      // its own (bandwidth/ABR), so we keep re-asserting it every tick.
+      try {
+        var p = document.getElementById('movie_player');
+        if (p && p.getAvailableQualityLevels) {
+          var levels = p.getAvailableQualityLevels();
+          if (levels && levels.length) {
+            var best = levels[0]; // array is ordered highest -> lowest
+            if (p.setPlaybackQualityRange) p.setPlaybackQualityRange(best, best);
+            if (p.setPlaybackQuality) p.setPlaybackQuality(best);
+          }
+        }
+      } catch (e) {}
     }, 400);
     window.dispatchEvent(new Event('resize'));
   })();

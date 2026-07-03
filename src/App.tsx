@@ -53,6 +53,9 @@ interface VideoState {
   time: number;
   duration: number;
   paused: boolean;
+  vw: number; // current decoded video width
+  vh: number; // current decoded video height
+  maxH: number; // max available resolution height (from YouTube quality levels)
 }
 
 function Player({
@@ -73,6 +76,9 @@ function Player({
     time: 0,
     duration: 0,
     paused: true,
+    vw: 0,
+    vh: 0,
+    maxH: 0,
   });
   const [scrub, setScrub] = useState<number | null>(null);
   const scrubRef = useRef(false);
@@ -108,8 +114,13 @@ function Player({
     const id = setInterval(async () => {
       if (scrubRef.current) return;
       const s = await runInGuest<VideoState | null>(
-        "(()=>{const v=document.querySelector('video');" +
-          'return v?{time:v.currentTime,duration:(isFinite(v.duration)?v.duration:0),paused:v.paused}:null;})()',
+        '(()=>{const v=document.querySelector("video");if(!v)return null;' +
+          'var p=document.getElementById("movie_player");' +
+          'var lv=(p&&p.getAvailableQualityLevels)?p.getAvailableQualityLevels():[];' +
+          'var map={highres:4320,hd2160:2160,hd1440:1440,hd1080:1080,hd720:720,large:480,medium:360,small:240,tiny:144};' +
+          'var maxH=0;for(var i=0;i<lv.length;i++){var h=map[lv[i]]||0;if(h>maxH)maxH=h;}' +
+          'return {time:v.currentTime,duration:(isFinite(v.duration)?v.duration:0),paused:v.paused,' +
+          'vw:v.videoWidth||0,vh:v.videoHeight||0,maxH:maxH};})()',
       );
       if (s) setVideo(s);
     }, 500);
@@ -191,6 +202,11 @@ function Player({
         <div className="statusline">
           <span className={`dot ${status.running ? 'on' : 'off'}`} />
           <b>{status.serverName}</b>
+          {video.vh > 0 && (
+            <span title="current resolution / this video's max resolution">
+              · {video.vh}p / {video.maxH > 0 ? `${video.maxH}p` : '—'}
+            </span>
+          )}
           <span>· {status.fps} fps</span>
           <span>· {status.hasClients ? 'connected' : 'no receiver'}</span>
         </div>
