@@ -8,32 +8,57 @@ if (started) {
   app.quit();
 }
 
-// ---- Output constants (spec: 720p fixed, ~30fps) --------------------------
-const OUT_W = 1280;
-const OUT_H = 720;
-const TARGET_FPS = 30;
+// ---- Output constants (spec: 1080p fixed, ~60fps) -------------------------
+const OUT_W = 1920;
+const OUT_H = 1080;
+const TARGET_FPS = 60;
 const FRAME_INTERVAL_MS = Math.round(1000 / TARGET_FPS);
 
-const syphon = new SyphonManager('URLtoSyphon');
+// ---- Channels (two independent players: left + right) ---------------------
+// Each channel drives its own <webview> guest, its own Syphon server, and its
+// own capture loop, so the two sides publish two separate Syphon sources.
+type ChannelId = 'left' | 'right';
 
-// The guest <webview>'s webContents, captured in the MAIN process.
-let guestContentsId: number | null = null;
+interface Channel {
+  readonly id: ChannelId;
+  readonly serverName: string;
+  readonly syphon: SyphonManager;
+  guestContentsId: number | null;
+  captureTimer: NodeJS.Timeout | null;
+  inFlight: boolean; // capturePage is async; skip a tick if the last is still running.
+  testFrame: boolean; // publish a solid red frame instead of the webview.
+  hideControls: boolean; // hide YouTube's playback bar + captions.
+  hideCssKey: string | null; // insertCSS key for the CURRENT page (invalidated on navigation).
+  framesThisSecond: number;
+  lastFpsStamp: number;
+  measuredFps: number;
+}
 
-// Capture loop state.
-let captureTimer: NodeJS.Timeout | null = null;
-let inFlight = false; // capturePage is async; skip a tick if the last is still running.
-let testFrame = false; // Phase-0: publish a solid red frame instead of the webview.
+function makeChannel(id: ChannelId, serverName: string): Channel {
+  return {
+    id,
+    serverName,
+    syphon: new SyphonManager(serverName),
+    guestContentsId: null,
+    captureTimer: null,
+    inFlight: false,
+    testFrame: false,
+    hideControls: true,
+    hideCssKey: null,
+    framesThisSecond: 0,
+    lastFpsStamp: Date.now(),
+    measuredFps: 0,
+  };
+}
 
-// Hide YouTube's playback bar + captions by default. `hideCssKey` is the key
-// returned by insertCSS for the CURRENT page (invalidated on navigation), so we
-// can removeInsertedCSS when toggled off.
-let hideControls = true;
-let hideCssKey: string | null = null;
+const channels: Record<ChannelId, Channel> = {
+  left: makeChannel('left', 'URLtoSyphon-L'),
+  right: makeChannel('right', 'URLtoSyphon-R'),
+};
 
-// fps measurement
-let framesThisSecond = 0;
-let lastFpsStamp = Date.now();
-let measuredFps = 0;
+function getChannel(id: unknown): Channel | null {
+  return id === 'left' || id === 'right' ? channels[id] : null;
+}
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -107,19 +132,19 @@ const AD_SKIP_JS = `
   })();
 `;
 
-function setupYouTubeCleanup(guest: Electron.WebContents) {
+function setupYouTubeCleanup(guest: Electron.WebContents, ch: Channel) {
   const apply = () => {
     const url = guest.getURL();
     if (!/youtube\.com|youtu\.be/.test(url)) return;
     guest.insertCSS(PLAYER_ONLY_CSS).catch((): void => {});
     guest.executeJavaScript(AD_SKIP_JS).catch((): void => {});
     // The previous page's key is invalid after navigation; re-insert if enabled.
-    hideCssKey = null;
-    if (hideControls) {
+    ch.hideCssKey = null;
+    if (ch.hideControls) {
       guest
         .insertCSS(CHROME_HIDE_CSS)
         .then((key) => {
-          hideCssKey = key;
+          ch.hideCssKey = key;
         })
         .catch((): void => {});
     }
@@ -131,8 +156,8 @@ function setupYouTubeCleanup(guest: Electron.WebContents) {
 
 const createWindow = () => {
   mainWindow = new BrowserWindow({
-    width: 1180,
-    height: 820,
+    width: 1680,
+    height: 900,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       // Enable the <webview> tag used to render YouTube etc.
@@ -140,18 +165,6 @@ const createWindow = () => {
       contextIsolation: true,
       nodeIntegration: false,
     },
-  });
-
-  // Grab the guest webview's webContents as soon as it attaches. We capture
-  // pixels here in main (not in the renderer) for two reasons:
-  //   1. YouTube in a <webview> is cross-origin, so a renderer canvas
-  //      drawImage()+getImageData() would throw a "tainted canvas" security
-  //      error — you cannot read arbitrary cross-origin video that way.
-  //   2. node-syphon runs in main. Capturing here keeps the ~3.6 MB/frame
-  //      (1280*720*4) pixel buffer out of the renderer->main IPC channel.
-  mainWindow.webContents.on('did-attach-webview', (_e, guest) => {
-    guestContentsId = guest.id;
-    setupYouTubeCleanup(guest);
   });
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
@@ -163,7 +176,7 @@ const createWindow = () => {
   }
 };
 
-// ---- Capture loop ---------------------------------------------------------
+// ---- Capture loop (per channel) -------------------------------------------
 
 function makeRedFrame(): Uint8Array {
   // BGRA solid red (SyphonManager swizzles BGRA->RGBA).
@@ -177,20 +190,20 @@ function makeRedFrame(): Uint8Array {
   return buf;
 }
 
-async function captureTick() {
-  if (inFlight) return;
-  inFlight = true;
+async function captureTick(ch: Channel) {
+  if (ch.inFlight) return;
+  ch.inFlight = true;
   try {
-    if (testFrame) {
-      syphon.publishBGRA(makeRedFrame(), OUT_W, OUT_H);
-      countFrame();
+    if (ch.testFrame) {
+      ch.syphon.publishBGRA(makeRedFrame(), OUT_W, OUT_H);
+      countFrame(ch);
       return;
     }
 
-    if (guestContentsId == null) return;
-    const guest = webContents.fromId(guestContentsId);
+    if (ch.guestContentsId == null) return;
+    const guest = webContents.fromId(ch.guestContentsId);
     if (!guest || guest.isDestroyed()) {
-      guestContentsId = null;
+      ch.guestContentsId = null;
       return;
     }
 
@@ -200,123 +213,160 @@ async function captureTick() {
     const resized = image.resize({ width: OUT_W, height: OUT_H, quality: 'good' });
     // toBitmap() returns a BGRA buffer (getBitmap is a mistyped legacy alias).
     const bgra = resized.toBitmap();
-    if (syphon.publishBGRA(bgra, OUT_W, OUT_H)) countFrame();
+    if (ch.syphon.publishBGRA(bgra, OUT_W, OUT_H)) countFrame(ch);
   } catch (err) {
     // Don't kill the loop on a transient capture error; surface it.
     sendStatus({ error: err instanceof Error ? err.message : String(err) });
   } finally {
-    inFlight = false;
+    ch.inFlight = false;
   }
 }
 
-function countFrame() {
-  framesThisSecond++;
+function countFrame(ch: Channel) {
+  ch.framesThisSecond++;
   const now = Date.now();
-  if (now - lastFpsStamp >= 1000) {
-    measuredFps = framesThisSecond;
-    framesThisSecond = 0;
-    lastFpsStamp = now;
+  if (now - ch.lastFpsStamp >= 1000) {
+    ch.measuredFps = ch.framesThisSecond;
+    ch.framesThisSecond = 0;
+    ch.lastFpsStamp = now;
     sendStatus({});
   }
 }
 
-function startCapture() {
-  if (captureTimer) return;
-  lastFpsStamp = Date.now();
-  framesThisSecond = 0;
-  captureTimer = setInterval(captureTick, FRAME_INTERVAL_MS);
+function startCapture(ch: Channel) {
+  if (ch.captureTimer) return;
+  ch.lastFpsStamp = Date.now();
+  ch.framesThisSecond = 0;
+  ch.captureTimer = setInterval(() => captureTick(ch), FRAME_INTERVAL_MS);
 }
 
-function stopCapture() {
-  if (captureTimer) {
-    clearInterval(captureTimer);
-    captureTimer = null;
+function stopCapture(ch: Channel) {
+  if (ch.captureTimer) {
+    clearInterval(ch.captureTimer);
+    ch.captureTimer = null;
   }
-  measuredFps = 0;
+  ch.measuredFps = 0;
 }
 
 // ---- Status -> renderer ---------------------------------------------------
 
+function channelStatus(ch: Channel) {
+  return {
+    running: ch.syphon.isRunning,
+    capturing: ch.captureTimer !== null,
+    hasClients: ch.syphon.hasClients,
+    fps: ch.measuredFps,
+    serverName: ch.serverName,
+    error: ch.syphon.error,
+    testFrame: ch.testFrame,
+    hideControls: ch.hideControls,
+  };
+}
+
+function appStatus() {
+  return {
+    left: channelStatus(channels.left),
+    right: channelStatus(channels.right),
+  };
+}
+
 function sendStatus(extra: { error?: string }) {
-  mainWindow?.webContents.send('app:status', {
-    running: syphon.isRunning,
-    capturing: captureTimer !== null,
-    hasClients: syphon.hasClients,
-    fps: measuredFps,
-    serverName: 'URLtoSyphon',
-    error: extra.error ?? syphon.error,
-    testFrame,
-    hideControls,
-  });
+  const status = appStatus();
+  if (extra.error) {
+    status.left = { ...status.left, error: extra.error };
+    status.right = { ...status.right, error: extra.error };
+  }
+  mainWindow?.webContents.send('app:status', status);
 }
 
 // ---- IPC ------------------------------------------------------------------
 
-ipcMain.handle('app:start-output', () => {
-  if (!syphon.start()) {
-    return { ok: false, error: syphon.error };
+// Renderer tells us which webContents id belongs to which channel (it reads
+// <webview>.getWebContentsId() on dom-ready). This avoids relying on the order
+// of did-attach-webview events.
+ipcMain.handle(
+  'app:register-guest',
+  (_e, channelId: ChannelId, contentsId: number) => {
+    const ch = getChannel(channelId);
+    if (!ch) return { ok: false };
+    if (ch.guestContentsId === contentsId) return { ok: true };
+    const guest = webContents.fromId(contentsId);
+    if (!guest || guest.isDestroyed()) return { ok: false };
+    ch.guestContentsId = contentsId;
+    setupYouTubeCleanup(guest, ch);
+    return { ok: true };
+  },
+);
+
+ipcMain.handle('app:start-output', (_e, channelId: ChannelId) => {
+  const ch = getChannel(channelId);
+  if (!ch) return { ok: false, error: 'unknown channel' };
+  if (!ch.syphon.start()) {
+    return { ok: false, error: ch.syphon.error };
   }
-  startCapture();
+  startCapture(ch);
   sendStatus({});
   return { ok: true };
 });
 
-ipcMain.handle('app:stop-output', () => {
-  stopCapture();
-  syphon.dispose();
+ipcMain.handle('app:stop-output', (_e, channelId: ChannelId) => {
+  const ch = getChannel(channelId);
+  if (!ch) return { ok: false, error: 'unknown channel' };
+  stopCapture(ch);
+  ch.syphon.dispose();
   sendStatus({});
   return { ok: true };
 });
 
-ipcMain.handle('app:test-frame', (_e, on: boolean) => {
-  testFrame = on;
-  if (on && !syphon.start()) return { ok: false, error: syphon.error };
-  if (on) startCapture();
+ipcMain.handle('app:test-frame', (_e, channelId: ChannelId, on: boolean) => {
+  const ch = getChannel(channelId);
+  if (!ch) return { ok: false, error: 'unknown channel' };
+  ch.testFrame = on;
+  if (on && !ch.syphon.start()) return { ok: false, error: ch.syphon.error };
+  if (on) startCapture(ch);
   sendStatus({});
   return { ok: true };
 });
 
-ipcMain.handle('app:set-hide-controls', async (_e, on: boolean) => {
-  hideControls = on;
-  const guest =
-    guestContentsId != null ? webContents.fromId(guestContentsId) : null;
-  if (guest && !guest.isDestroyed()) {
-    if (hideCssKey) {
-      try {
-        await guest.removeInsertedCSS(hideCssKey);
-      } catch {
-        /* stale key after navigation — ignore */
+ipcMain.handle(
+  'app:set-hide-controls',
+  async (_e, channelId: ChannelId, on: boolean) => {
+    const ch = getChannel(channelId);
+    if (!ch) return { ok: false, error: 'unknown channel' };
+    ch.hideControls = on;
+    const guest =
+      ch.guestContentsId != null ? webContents.fromId(ch.guestContentsId) : null;
+    if (guest && !guest.isDestroyed()) {
+      if (ch.hideCssKey) {
+        try {
+          await guest.removeInsertedCSS(ch.hideCssKey);
+        } catch {
+          /* stale key after navigation — ignore */
+        }
+        ch.hideCssKey = null;
       }
-      hideCssKey = null;
-    }
-    if (on) {
-      try {
-        hideCssKey = await guest.insertCSS(CHROME_HIDE_CSS);
-      } catch {
-        /* ignore */
+      if (on) {
+        try {
+          ch.hideCssKey = await guest.insertCSS(CHROME_HIDE_CSS);
+        } catch {
+          /* ignore */
+        }
       }
     }
-  }
-  sendStatus({});
-  return { ok: true };
-});
+    sendStatus({});
+    return { ok: true };
+  },
+);
 
-ipcMain.handle('app:get-status', () => ({
-  running: syphon.isRunning,
-  capturing: captureTimer !== null,
-  hasClients: syphon.hasClients,
-  fps: measuredFps,
-  serverName: 'URLtoSyphon',
-  error: syphon.error,
-  testFrame,
-  hideControls,
-}));
+ipcMain.handle('app:get-status', () => appStatus());
 
 app.on('ready', createWindow);
 
 app.on('window-all-closed', () => {
-  stopCapture();
-  syphon.dispose();
+  for (const ch of Object.values(channels)) {
+    stopCapture(ch);
+    ch.syphon.dispose();
+  }
   if (process.platform !== 'darwin') {
     app.quit();
   }

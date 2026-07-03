@@ -15,11 +15,37 @@ body {
   color: #e7e9ee;
 }
 
-#root,
+#root {
+  height: 100vh;
+}
+
+/* Two players side by side. */
 .app {
   height: 100vh;
   display: flex;
+  flex-direction: row;
+}
+
+.player {
+  flex: 1;
+  min-width: 0;
+  display: flex;
   flex-direction: column;
+}
+
+.divider {
+  width: 1px;
+  background: #2b2f38;
+}
+
+.bar.sub {
+  padding-top: 0;
+}
+
+.bar .statusline {
+  padding: 0;
+  background: transparent;
+  border: 0;
 }
 
 .bar {
@@ -138,11 +164,16 @@ button.danger {
 
 .transport {
   display: flex;
-  gap: 12px;
+  gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
   padding: 10px 14px;
   background: #1e2128;
   border-top: 1px solid #2b2f38;
+}
+
+.transport .seek {
+  min-width: 140px;
 }
 
 .transport .playpause {

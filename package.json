@@ -1,6 +1,6 @@
 {
-  "name": "url-to-syphon",
-  "productName": "URL to Syphon",
+  "name": "tube-to-syphon",
+  "productName": "Tube to Syphon",
   "version": "0.1.0",
   "description": "Play a video URL (YouTube etc.) and output it as a Syphon source on macOS",
   "main": ".vite/build/main.js",

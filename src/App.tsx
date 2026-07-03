@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type { AppStatus } from './preload';
+import type { AppStatus, ChannelId, ChannelStatus } from './preload';
 
 /**
  * Normalise a pasted URL. We deliberately use the normal **watch page**, not the
@@ -26,16 +26,18 @@ const DESKTOP_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
-const EMPTY_STATUS: AppStatus = {
+const EMPTY_CHANNEL: ChannelStatus = {
   running: false,
   capturing: false,
   hasClients: false,
   fps: 0,
-  serverName: 'URLtoSyphon',
+  serverName: '',
   error: null,
   testFrame: false,
   hideControls: true,
 };
+
+const EMPTY_STATUS: AppStatus = { left: EMPTY_CHANNEL, right: EMPTY_CHANNEL };
 
 // mm:ss (or h:mm:ss) for the transport time labels.
 function fmtTime(sec: number): string {
@@ -53,10 +55,15 @@ interface VideoState {
   paused: boolean;
 }
 
-export default function App() {
+function Player({
+  channel,
+  status,
+}: {
+  channel: ChannelId;
+  status: ChannelStatus;
+}) {
   const [input, setInput] = useState('');
   const [loadedUrl, setLoadedUrl] = useState('');
-  const [status, setStatus] = useState<AppStatus>(EMPTY_STATUS);
   const webviewRef = useRef<HTMLElement | null>(null);
 
   // Custom transport (native YouTube controls are hidden). The <webview> lives
@@ -67,8 +74,6 @@ export default function App() {
     duration: 0,
     paused: true,
   });
-  // While the user drags the seek bar, hold the poll off and show the dragged
-  // value instead of the (stale) playback position.
   const [scrub, setScrub] = useState<number | null>(null);
   const scrubRef = useRef(false);
 
@@ -84,11 +89,19 @@ export default function App() {
     }
   };
 
+  // Register this webview's contentsId with main so it can capture + inject CSS.
   useEffect(() => {
-    window.api.getStatus().then(setStatus);
-    const off = window.api.onStatus(setStatus);
-    return off;
-  }, []);
+    const wv = webviewRef.current;
+    if (!wv) return;
+    const onReady = () => {
+      const id = (
+        wv as unknown as { getWebContentsId?: () => number }
+      ).getWebContentsId?.();
+      if (typeof id === 'number') window.api.registerGuest(channel, id);
+    };
+    wv.addEventListener('dom-ready', onReady);
+    return () => wv.removeEventListener('dom-ready', onReady);
+  }, [channel]);
 
   // Poll the guest <video> state for the transport bar.
   useEffect(() => {
@@ -103,32 +116,10 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
-  const togglePlay = () =>
-    runInGuest(
-      "(()=>{const v=document.querySelector('video');if(v){v.paused?v.play():v.pause();}})()",
-    );
-
-  const seekTo = (t: number) =>
-    runInGuest(
-      `(()=>{const v=document.querySelector('video');if(v)v.currentTime=${t};})()`,
-    );
-
-  // Jump relative to the current position, clamped to [0, duration]. Optimistic
-  // local update so the UI reacts instantly before the next poll.
-  const skip = (delta: number) => {
-    const dur = video.duration || 0;
-    const next = Math.min(Math.max(video.time + delta, 0), dur || Infinity);
-    setVideo((v) => ({ ...v, time: next }));
-    seekTo(next);
-  };
-
-  const displayTime = scrub != null ? scrub : video.time;
-
   const play = () => {
     if (!input.trim()) return;
     const url = toPlayableUrl(input);
     setLoadedUrl(url);
-    // Setting src directly on the element also works if the ref is ready.
     if (webviewRef.current) {
       (webviewRef.current as unknown as { src: string }).src = url;
     }
@@ -141,26 +132,37 @@ export default function App() {
 
   const toggleOutput = async () => {
     const res = status.running
-      ? await window.api.stopOutput()
-      : await window.api.startOutput();
+      ? await window.api.stopOutput(channel)
+      : await window.api.startOutput(channel);
     if (!res.ok && res.error) alert(res.error);
-    setStatus(await window.api.getStatus());
-  };
-
-  const toggleTest = async () => {
-    const res = await window.api.testFrame(!status.testFrame);
-    if (!res.ok && res.error) alert(res.error);
-    setStatus(await window.api.getStatus());
   };
 
   const toggleHideControls = async () => {
-    const res = await window.api.setHideControls(!status.hideControls);
+    const res = await window.api.setHideControls(channel, !status.hideControls);
     if (!res.ok && res.error) alert(res.error);
-    setStatus(await window.api.getStatus());
   };
 
+  const togglePlay = () =>
+    runInGuest(
+      "(()=>{const v=document.querySelector('video');if(v){v.paused?v.play():v.pause();}})()",
+    );
+
+  const seekTo = (t: number) =>
+    runInGuest(
+      `(()=>{const v=document.querySelector('video');if(v)v.currentTime=${t};})()`,
+    );
+
+  const skip = (delta: number) => {
+    const dur = video.duration || 0;
+    const next = Math.min(Math.max(video.time + delta, 0), dur || Infinity);
+    setVideo((v) => ({ ...v, time: next }));
+    seekTo(next);
+  };
+
+  const displayTime = scrub != null ? scrub : video.time;
+
   return (
-    <div className="app">
+    <div className="player">
       <header className="bar">
         <input
           className="url"
@@ -173,7 +175,9 @@ export default function App() {
         <button onClick={play} disabled={!input.trim()}>
           Play
         </button>
-        <div className="spacer" />
+      </header>
+
+      <div className="bar sub">
         <button
           className={status.running ? 'danger' : 'primary'}
           onClick={toggleOutput}
@@ -183,36 +187,30 @@ export default function App() {
         <button onClick={toggleHideControls}>
           {status.hideControls ? 'Controls: hidden' : 'Controls: shown'}
         </button>
-        <button onClick={toggleTest}>
-          {status.testFrame ? 'Test frame: ON' : 'Test frame'}
-        </button>
-      </header>
-
-      <div className="statusline">
-        <span className={`dot ${status.running ? 'on' : 'off'}`} />
-        <b>{status.serverName}</b>
-        <span>{status.running ? 'publishing' : 'stopped'}</span>
-        <span>· {status.fps} fps</span>
-        <span>· receivers: {status.hasClients ? 'connected' : 'none'}</span>
-        {status.testFrame && <span className="warn">· TEST RED FRAME</span>}
-        {status.error && <span className="error">· {status.error}</span>}
+        <div className="spacer" />
+        <div className="statusline">
+          <span className={`dot ${status.running ? 'on' : 'off'}`} />
+          <b>{status.serverName}</b>
+          <span>· {status.fps} fps</span>
+          <span>· {status.hasClients ? 'connected' : 'no receiver'}</span>
+        </div>
       </div>
+      {status.error && <div className="statusline error">{status.error}</div>}
 
       <div className="stage">
         <webview
           ref={webviewRef as React.Ref<HTMLElement>}
           src={loadedUrl || undefined}
-          partition="persist:player"
+          partition={`persist:player-${channel}`}
           useragent={DESKTOP_UA}
           className="webview"
-          // allowpopups is a string DOM attribute on <webview>; React's typed
-          // union treats it as boolean, so pass it through untyped.
           {...({ allowpopups: 'true' } as Record<string, string>)}
         />
         {!loadedUrl && (
           <div className="placeholder">
-            Paste a URL above and press Play. Then “Start Syphon” to output
-            1280×720 to a receiver as <b>URLtoSyphon</b>.
+            Paste a URL and press Play, then “Start Syphon”.
+            <br />
+            Outputs 1920×1080 as <b>{status.serverName}</b>.
           </div>
         )}
       </div>
@@ -274,6 +272,24 @@ export default function App() {
         />
         <span className="time">{fmtTime(video.duration)}</span>
       </footer>
+    </div>
+  );
+}
+
+export default function App() {
+  const [status, setStatus] = useState<AppStatus>(EMPTY_STATUS);
+
+  useEffect(() => {
+    window.api.getStatus().then(setStatus);
+    const off = window.api.onStatus(setStatus);
+    return off;
+  }, []);
+
+  return (
+    <div className="app">
+      <Player channel="left" status={status.left} />
+      <div className="divider" />
+      <Player channel="right" status={status.right} />
     </div>
   );
 }
