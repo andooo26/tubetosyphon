@@ -89,8 +89,8 @@ function setupYouTubeCleanup(guest: Electron.WebContents) {
   const apply = () => {
     const url = guest.getURL();
     if (!/youtube\.com|youtu\.be/.test(url)) return;
-    guest.insertCSS(PLAYER_ONLY_CSS).catch(() => undefined);
-    guest.executeJavaScript(AD_SKIP_JS).catch(() => undefined);
+    guest.insertCSS(PLAYER_ONLY_CSS).catch((): void => {});
+    guest.executeJavaScript(AD_SKIP_JS).catch((): void => {});
   };
   guest.on('dom-ready', apply);
   // YouTube is a SPA; re-apply on in-page navigations too.

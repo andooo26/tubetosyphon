@@ -88,6 +88,24 @@ npm start
 
 ---
 
+## YouTube playback: chrome & ads
+
+YouTube links load the normal **watch page** (the `/embed/` player fails with
+"Error 153" on videos whose owners disabled embedding). To keep the Syphon output
+clean, `src/main.ts` injects, on every YouTube navigation:
+
+- **CSS** that hides the masthead / sidebar / comments and expands the player to
+  fill the window, so `capturePage()` grabs **video only** (`PLAYER_ONLY_CSS`).
+- **JS** that auto-clicks "Skip Ad" and fast-forwards through unskippable ads
+  (`AD_SKIP_JS`). This is best-effort.
+
+**Fully ad-free options** (YouTube ads stream from the same host as the video, so
+they can't be cleanly URL-blocked):
+
+- Log in to a **YouTube Premium** account once in the player — the session is kept
+  in the `persist:player` partition, so ads disappear for good.
+- Or integrate an adblock engine (e.g. `@cliqz/adblocker-electron`) — not bundled.
+
 ## Receiving in SynapseRack
 
 1. Add a **Syphon Receiver** node.
