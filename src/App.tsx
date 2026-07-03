@@ -34,7 +34,24 @@ const EMPTY_STATUS: AppStatus = {
   serverName: 'URLtoSyphon',
   error: null,
   testFrame: false,
+  hideControls: true,
 };
+
+// mm:ss (or h:mm:ss) for the transport time labels.
+function fmtTime(sec: number): string {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  const s = Math.floor(sec % 60);
+  const m = Math.floor((sec / 60) % 60);
+  const h = Math.floor(sec / 3600);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+interface VideoState {
+  time: number;
+  duration: number;
+  paused: boolean;
+}
 
 export default function App() {
   const [input, setInput] = useState('');
@@ -42,11 +59,61 @@ export default function App() {
   const [status, setStatus] = useState<AppStatus>(EMPTY_STATUS);
   const webviewRef = useRef<HTMLElement | null>(null);
 
+  // Custom transport (native YouTube controls are hidden). The <webview> lives
+  // in this renderer, so we drive the <video> element directly with
+  // executeJavaScript — no main-process round-trip needed.
+  const [video, setVideo] = useState<VideoState>({
+    time: 0,
+    duration: 0,
+    paused: true,
+  });
+  // While the user drags the seek bar, hold the poll off and show the dragged
+  // value instead of the (stale) playback position.
+  const [scrub, setScrub] = useState<number | null>(null);
+  const scrubRef = useRef(false);
+
+  const runInGuest = async <T,>(code: string): Promise<T | null> => {
+    const wv = webviewRef.current as unknown as {
+      executeJavaScript?: (c: string) => Promise<T>;
+    } | null;
+    if (!wv || typeof wv.executeJavaScript !== 'function') return null;
+    try {
+      return await wv.executeJavaScript(code);
+    } catch {
+      return null;
+    }
+  };
+
   useEffect(() => {
     window.api.getStatus().then(setStatus);
     const off = window.api.onStatus(setStatus);
     return off;
   }, []);
+
+  // Poll the guest <video> state for the transport bar.
+  useEffect(() => {
+    const id = setInterval(async () => {
+      if (scrubRef.current) return;
+      const s = await runInGuest<VideoState | null>(
+        "(()=>{const v=document.querySelector('video');" +
+          'return v?{time:v.currentTime,duration:(isFinite(v.duration)?v.duration:0),paused:v.paused}:null;})()',
+      );
+      if (s) setVideo(s);
+    }, 500);
+    return () => clearInterval(id);
+  }, []);
+
+  const togglePlay = () =>
+    runInGuest(
+      "(()=>{const v=document.querySelector('video');if(v){v.paused?v.play():v.pause();}})()",
+    );
+
+  const seekTo = (t: number) =>
+    runInGuest(
+      `(()=>{const v=document.querySelector('video');if(v)v.currentTime=${t};})()`,
+    );
+
+  const displayTime = scrub != null ? scrub : video.time;
 
   const play = () => {
     if (!input.trim()) return;
@@ -77,6 +144,12 @@ export default function App() {
     setStatus(await window.api.getStatus());
   };
 
+  const toggleHideControls = async () => {
+    const res = await window.api.setHideControls(!status.hideControls);
+    if (!res.ok && res.error) alert(res.error);
+    setStatus(await window.api.getStatus());
+  };
+
   return (
     <div className="app">
       <header className="bar">
@@ -97,6 +170,9 @@ export default function App() {
           onClick={toggleOutput}
         >
           {status.running ? 'Stop Syphon' : 'Start Syphon'}
+        </button>
+        <button onClick={toggleHideControls}>
+          {status.hideControls ? 'Controls: hidden' : 'Controls: shown'}
         </button>
         <button onClick={toggleTest}>
           {status.testFrame ? 'Test frame: ON' : 'Test frame'}
@@ -131,6 +207,42 @@ export default function App() {
           </div>
         )}
       </div>
+
+      <footer className="transport">
+        <button
+          className="playpause"
+          onClick={togglePlay}
+          disabled={!loadedUrl}
+          title={video.paused ? 'Play' : 'Pause'}
+        >
+          {video.paused ? '▶' : '❚❚'}
+        </button>
+        <span className="time">{fmtTime(displayTime)}</span>
+        <input
+          className="seek"
+          type="range"
+          min={0}
+          max={video.duration || 0}
+          step={0.1}
+          value={Math.min(displayTime, video.duration || 0)}
+          disabled={!loadedUrl || video.duration <= 0}
+          onChange={(e) => {
+            scrubRef.current = true;
+            setScrub(Number(e.target.value));
+          }}
+          onPointerUp={() => {
+            if (scrub != null) seekTo(scrub);
+            scrubRef.current = false;
+            setScrub(null);
+          }}
+          onKeyUp={() => {
+            if (scrub != null) seekTo(scrub);
+            scrubRef.current = false;
+            setScrub(null);
+          }}
+        />
+        <span className="time">{fmtTime(video.duration)}</span>
+      </footer>
     </div>
   );
 }

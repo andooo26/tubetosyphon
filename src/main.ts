@@ -24,6 +24,12 @@ let captureTimer: NodeJS.Timeout | null = null;
 let inFlight = false; // capturePage is async; skip a tick if the last is still running.
 let testFrame = false; // Phase-0: publish a solid red frame instead of the webview.
 
+// Hide YouTube's playback bar + captions by default. `hideCssKey` is the key
+// returned by insertCSS for the CURRENT page (invalidated on navigation), so we
+// can removeInsertedCSS when toggled off.
+let hideControls = true;
+let hideCssKey: string | null = null;
+
 // fps measurement
 let framesThisSecond = 0;
 let lastFpsStamp = Date.now();
@@ -61,6 +67,22 @@ const PLAYER_ONLY_CSS = `
   }
 `;
 
+// Hides the playback/seek bar + controls and captions so the captured frame is
+// clean video only. Managed separately from PLAYER_ONLY_CSS (inserted/removed
+// via a tracked key) so the UI can toggle it on and off at runtime.
+const CHROME_HIDE_CSS = `
+  /* playback/seek bar + controls + gradients */
+  .ytp-chrome-bottom, .ytp-chrome-top, .ytp-gradient-bottom, .ytp-gradient-top,
+  .ytp-progress-bar-container, .ytp-chrome-controls {
+    display: none !important;
+  }
+  /* captions / subtitles */
+  .ytp-caption-window-container, .caption-window, .ytp-caption-segment,
+  .captions-text {
+    display: none !important;
+  }
+`;
+
 const AD_SKIP_JS = `
   (function () {
     if (window.__u2s_adskip) return;
@@ -91,6 +113,16 @@ function setupYouTubeCleanup(guest: Electron.WebContents) {
     if (!/youtube\.com|youtu\.be/.test(url)) return;
     guest.insertCSS(PLAYER_ONLY_CSS).catch((): void => {});
     guest.executeJavaScript(AD_SKIP_JS).catch((): void => {});
+    // The previous page's key is invalid after navigation; re-insert if enabled.
+    hideCssKey = null;
+    if (hideControls) {
+      guest
+        .insertCSS(CHROME_HIDE_CSS)
+        .then((key) => {
+          hideCssKey = key;
+        })
+        .catch((): void => {});
+    }
   };
   guest.on('dom-ready', apply);
   // YouTube is a SPA; re-apply on in-page navigations too.
@@ -214,6 +246,7 @@ function sendStatus(extra: { error?: string }) {
     serverName: 'URLtoSyphon',
     error: extra.error ?? syphon.error,
     testFrame,
+    hideControls,
   });
 }
 
@@ -243,6 +276,31 @@ ipcMain.handle('app:test-frame', (_e, on: boolean) => {
   return { ok: true };
 });
 
+ipcMain.handle('app:set-hide-controls', async (_e, on: boolean) => {
+  hideControls = on;
+  const guest =
+    guestContentsId != null ? webContents.fromId(guestContentsId) : null;
+  if (guest && !guest.isDestroyed()) {
+    if (hideCssKey) {
+      try {
+        await guest.removeInsertedCSS(hideCssKey);
+      } catch {
+        /* stale key after navigation — ignore */
+      }
+      hideCssKey = null;
+    }
+    if (on) {
+      try {
+        hideCssKey = await guest.insertCSS(CHROME_HIDE_CSS);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  sendStatus({});
+  return { ok: true };
+});
+
 ipcMain.handle('app:get-status', () => ({
   running: syphon.isRunning,
   capturing: captureTimer !== null,
@@ -251,6 +309,7 @@ ipcMain.handle('app:get-status', () => ({
   serverName: 'URLtoSyphon',
   error: syphon.error,
   testFrame,
+  hideControls,
 }));
 
 app.on('ready', createWindow);
