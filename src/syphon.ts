@@ -109,9 +109,10 @@ export class SyphonManager {
         new Uint8ClampedArray(out.buffer, out.byteOffset, expected),
         { x: 0, y: 0, width, height },
         { width, height },
-        // flipped=false: Electron's bitmap is already top-left origin.
-        // If the output appears upside-down in your receiver, flip this.
-        false,
+        // flipped=true: Electron's bitmap is top-left origin but Syphon/Metal
+        // textures are bottom-left origin, so the image must be flipped
+        // vertically or it comes out upside-down in the receiver.
+        true,
       );
       return true;
     } catch (err) {
