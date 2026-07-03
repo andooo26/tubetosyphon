@@ -36,6 +36,12 @@ export class SyphonManager {
   private server: InstanceType<SyphonServerCtor> | null = null;
   private lastError: string | null = null;
 
+  // Reused across frames to avoid allocating a fresh width*height*4 buffer
+  // (~3.6 MB at 720p) on every publish. At 30 fps that was ~110 MB/s of
+  // short-lived native-backed garbage, which GC struggled to keep up with and
+  // let external memory balloon. Grown on demand, never shrunk.
+  private swizzleBuf: Uint8Array | null = null;
+
   constructor(private readonly serverName = 'URLtoSyphon') {}
 
   /**
@@ -95,7 +101,10 @@ export class SyphonManager {
 
     let out = bgra;
     if (SWIZZLE_BGRA_TO_RGBA) {
-      out = new Uint8Array(expected);
+      if (!this.swizzleBuf || this.swizzleBuf.length < expected) {
+        this.swizzleBuf = new Uint8Array(expected);
+      }
+      out = this.swizzleBuf;
       for (let i = 0; i < expected; i += 4) {
         out[i] = bgra[i + 2]; // R <- B
         out[i + 1] = bgra[i + 1]; // G
@@ -130,5 +139,6 @@ export class SyphonManager {
       /* ignore */
     }
     this.server = null;
+    this.swizzleBuf = null;
   }
 }
