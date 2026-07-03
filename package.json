@@ -6,6 +6,7 @@
   "main": ".vite/build/main.js",
   "private": true,
   "scripts": {
+    "postinstall": "node scripts/apply-syphon-patch.js",
     "start": "electron-forge start",
     "package": "electron-forge package",
     "make": "electron-forge make",
