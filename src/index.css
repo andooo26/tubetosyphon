@@ -117,6 +117,10 @@ button.danger {
   width: 100%;
   height: 100%;
   border: 0;
+  /* Block all clicks/touches from reaching the player so playback can only be
+     controlled from the bottom transport panel. Does not affect our
+     executeJavaScript-based control. */
+  pointer-events: none;
 }
 
 .placeholder {
