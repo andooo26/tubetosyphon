@@ -32,6 +32,7 @@ interface Channel {
   framesThisSecond: number;
   lastFpsStamp: number;
   measuredFps: number;
+  frameBuf: Uint8Array | null; // reused OUT_W*OUT_H*4 letterbox canvas (grown never shrunk)
 }
 
 function makeChannel(id: ChannelId, serverName: string): Channel {
@@ -48,6 +49,7 @@ function makeChannel(id: ChannelId, serverName: string): Channel {
     framesThisSecond: 0,
     lastFpsStamp: Date.now(),
     measuredFps: 0,
+    frameBuf: null,
   };
 }
 
@@ -210,6 +212,33 @@ function makeRedFrame(): Uint8Array {
   return buf;
 }
 
+// Composite a BGRA source image (srcW*srcH) centred, at 1:1, onto a black
+// OUT_W*OUT_H BGRA canvas. The source is assumed to already be scaled to fit
+// within the canvas (see captureTick). Rows/cols are clamped so an unexpectedly
+// large source (e.g. a Retina scaleFactor slip) can never overrun the canvas.
+function letterbox(ch: Channel, src: Uint8Array, srcW: number, srcH: number): Uint8Array {
+  const size = OUT_W * OUT_H * 4;
+  if (!ch.frameBuf || ch.frameBuf.length < size) ch.frameBuf = new Uint8Array(size);
+  const canvas = ch.frameBuf;
+  // Opaque black bars (BGRA 0,0,0,255) so receivers that respect alpha still
+  // see solid black letterboxing, not transparency.
+  canvas.fill(0);
+  for (let i = 3; i < size; i += 4) canvas[i] = 255;
+
+  const w = Math.min(srcW, OUT_W);
+  const h = Math.min(srcH, OUT_H);
+  const offX = ((OUT_W - w) >> 1);
+  const offY = ((OUT_H - h) >> 1);
+  const srcStride = srcW * 4;
+  const dstStride = OUT_W * 4;
+  for (let y = 0; y < h; y++) {
+    const srcRow = y * srcStride;
+    const dstRow = (offY + y) * dstStride + offX * 4;
+    canvas.set(src.subarray(srcRow, srcRow + w * 4), dstRow);
+  }
+  return canvas;
+}
+
 async function captureTick(ch: Channel) {
   if (ch.inFlight) return;
   ch.inFlight = true;
@@ -227,13 +256,38 @@ async function captureTick(ch: Channel) {
       return;
     }
 
-    // capturePage() -> NativeImage at page resolution; resize to fixed 720p.
+    // capturePage() -> NativeImage of the (arbitrary-aspect) webview pane.
     const image = await guest.capturePage();
     if (image.isEmpty()) return;
-    const resized = image.resize({ width: OUT_W, height: OUT_H, quality: 'good' });
+
+    // Scale UNIFORMLY to fit within OUT_W x OUT_H, preserving the capture's
+    // aspect ratio, then letterbox onto a fixed 1920x1080 canvas. The webview
+    // pane is NOT 16:9 (it fills a flex area), so force-resizing to 1920x1080
+    // used to stretch the video horizontally — the classic "動画によって横長"
+    // bug. Uniform scale + letterbox keeps every video at correct proportions.
+    const src = image.getSize();
+    if (src.width <= 0 || src.height <= 0) return;
+    const scale = Math.min(OUT_W / src.width, OUT_H / src.height);
+    const dw = Math.max(1, Math.round(src.width * scale));
+    const dh = Math.max(1, Math.round(src.height * scale));
+    const resized = image.resize({ width: dw, height: dh, quality: 'good' });
     // toBitmap() returns a BGRA buffer (getBitmap is a mistyped legacy alias).
-    const bgra = resized.toBitmap();
-    if (ch.syphon.publishBGRA(bgra, OUT_W, OUT_H)) countFrame(ch);
+    // Force scaleFactor 1.0 so the buffer is exactly dw*dh px regardless of the
+    // display's Retina scale factor.
+    const bgra = resized.toBitmap({ scaleFactor: 1.0 });
+    // Guard against a scaleFactor slip: derive the true pixel size from length.
+    const px = bgra.length / 4;
+    let bw = dw;
+    let bh = dh;
+    if (px !== dw * dh && dw > 0) {
+      const k = Math.round(Math.sqrt(px / (dw * dh)));
+      if (k > 1) {
+        bw = dw * k;
+        bh = dh * k;
+      }
+    }
+    const frame = letterbox(ch, bgra, bw, bh);
+    if (ch.syphon.publishBGRA(frame, OUT_W, OUT_H)) countFrame(ch);
   } catch (err) {
     // Don't kill the loop on a transient capture error; surface it.
     sendStatus({ error: err instanceof Error ? err.message : String(err) });
