@@ -20,6 +20,25 @@
 // if the received image looks blue-ish where it should be red, set this to `false`.
 const SWIZZLE_BGRA_TO_RGBA = true;
 
+// Resolve where to load node-syphon from.
+//
+// In dev it's a normal node_modules require. In a packaged app, Electron
+// Forge's Vite plugin does NOT ship node_modules inside the asar, so we bundle
+// node-syphon + its deps (bindings -> file-uri-to-path) as a real node_modules
+// tree at Contents/Resources/node_modules (see forge.config.ts + the
+// build-native-bundle script) and require node-syphon from there. Node's module
+// resolution then finds `bindings` in the sibling Resources/node_modules, and
+// node-syphon's dist/bin/syphon.node + dist/Frameworks/Syphon.framework layout
+// keeps the addon's `@loader_path/../Frameworks` rpath resolvable.
+function syphonModulePath(): string {
+  // Lazy so importing this module never pulls electron in test contexts.
+  const { app } = require('electron') as typeof import('electron');
+  const path = require('node:path') as typeof import('node:path');
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'node_modules', 'node-syphon')
+    : 'node-syphon';
+}
+
 type SyphonServerCtor = new (name: string) => {
   publishImageData(
     data: Uint8ClampedArray,
@@ -53,7 +72,7 @@ export class SyphonManager {
     try {
       // Required late so a load failure produces a clear message instead of
       // crashing app startup.
-      const { SyphonMetalServer } = require('node-syphon') as {
+      const { SyphonMetalServer } = require(syphonModulePath()) as {
         SyphonMetalServer: SyphonServerCtor;
       };
       this.server = new SyphonMetalServer(this.serverName);

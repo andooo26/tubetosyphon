@@ -11,8 +11,26 @@ import { FuseV1Options, FuseVersion } from '@electron/fuses';
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
+    // The Vite plugin bundles main.js but does NOT ship node_modules in the
+    // asar. node-syphon is a native addon required at runtime, so ship it plus
+    // its dependency chain (bindings -> file-uri-to-path) as a real
+    // node_modules tree under Contents/Resources/node_modules. The
+    // prePackage hook (below) assembles native-bundle/node_modules first.
+    // syphon.ts requires node-syphon from process.resourcesPath/node_modules
+    // when packaged.
+    extraResource: ['./native-bundle/node_modules'],
   },
   rebuildConfig: {},
+  hooks: {
+    // Stage node-syphon + its runtime deps into native-bundle/node_modules
+    // right before packaging, so extraResource picks up a fresh copy.
+    prePackage: async () => {
+      const { execFileSync } = await import('node:child_process');
+      execFileSync(process.execPath, ['scripts/build-native-bundle.js'], {
+        stdio: 'inherit',
+      });
+    },
+  },
   makers: [
     new MakerSquirrel({}),
     new MakerZIP({}, ['darwin']),
