@@ -25,6 +25,9 @@ interface Channel {
   readonly syphon: SyphonManager;
   guestContentsId: number | null;
   onWatchPage: boolean; // capture real video? false only on a YouTube browse page (-> black).
+  isYouTube: boolean; // current guest page is YouTube (video fills the viewport via our CSS).
+  videoRect: { x: number; y: number; width: number; height: number } | null; // drawn-video region to capture
+  videoRectStamp: number; // when videoRect was last measured (throttle the JS round-trip)
   captureTimer: NodeJS.Timeout | null;
   inFlight: boolean; // capturePage is async; skip a tick if the last is still running.
   testFrame: boolean; // publish a solid red frame instead of the webview.
@@ -43,6 +46,9 @@ function makeChannel(id: ChannelId, serverName: string): Channel {
     syphon: new SyphonManager(serverName),
     guestContentsId: null,
     onWatchPage: false,
+    isYouTube: false,
+    videoRect: null,
+    videoRectStamp: 0,
     captureTimer: null,
     inFlight: false,
     testFrame: false,
@@ -198,6 +204,27 @@ const AD_SKIP_JS = `
   })();
 `;
 
+// Returns the on-screen rectangle (CSS px, relative to the guest viewport) where
+// the video pixels are actually drawn. Our injected CSS makes the <video> fill
+// the whole viewport with object-fit:contain, so the drawn region is the video's
+// aspect ratio fitted inside the viewport. Capturing exactly this region (instead
+// of the whole webview pane) avoids double letterboxing. Null if no sized video.
+const VIDEO_RECT_JS = `
+  (function () {
+    var v = document.querySelector('video');
+    if (!v || !v.videoWidth || !v.videoHeight) return null;
+    var elW = window.innerWidth, elH = window.innerHeight;
+    if (!elW || !elH) return null;
+    var vAR = v.videoWidth / v.videoHeight, eAR = elW / elH;
+    var w, h;
+    if (vAR > eAR) { w = elW; h = elW / vAR; } else { h = elH; w = elH * vAR; }
+    return {
+      x: Math.round((elW - w) / 2), y: Math.round((elH - h) / 2),
+      width: Math.round(w), height: Math.round(h)
+    };
+  })()
+`;
+
 function setupYouTubeCleanup(guest: Electron.WebContents, ch: Channel) {
   const apply = () => {
     const url = guest.getURL();
@@ -205,6 +232,10 @@ function setupYouTubeCleanup(guest: Electron.WebContents, ch: Channel) {
     // Output black only on YouTube *browse* pages. Non-YouTube URLs (arbitrary
     // video pages) are always captured; YouTube watch/shorts pages are captured.
     ch.onWatchPage = !isYouTube || isWatchUrl(url);
+    ch.isYouTube = isYouTube;
+    // Force a fresh video-rect measurement for the new page.
+    ch.videoRect = null;
+    ch.videoRectStamp = 0;
     if (!isYouTube) return;
     // The persistent-<style> injector (AD_SKIP_JS) applies/removes the
     // "video only" layout itself based on the live URL, so it self-heals across
@@ -324,8 +355,33 @@ async function captureTick(ch: Channel) {
       return;
     }
 
-    // capturePage() -> NativeImage of the (arbitrary-aspect) webview pane.
-    const image = await guest.capturePage();
+    // On YouTube our CSS makes the <video> fill the viewport (object-fit:contain),
+    // so the pane contains letterbox bars around the video. Capture ONLY the drawn
+    // video rectangle to avoid double letterboxing (bars from the pane + bars from
+    // our 1080p fit). Re-measure at most ~2x/sec; reuse the cached rect otherwise.
+    let rect = ch.videoRect;
+    if (ch.isYouTube) {
+      const now = Date.now();
+      if (!rect || now - ch.videoRectStamp > 500) {
+        try {
+          const r = (await guest.executeJavaScript(VIDEO_RECT_JS)) as
+            | { x: number; y: number; width: number; height: number }
+            | null;
+          ch.videoRect =
+            r && r.width > 0 && r.height > 0 ? r : null;
+          ch.videoRectStamp = now;
+          rect = ch.videoRect;
+        } catch {
+          /* keep the previous rect */
+        }
+      }
+    } else {
+      rect = null;
+    }
+
+    // capturePage() -> NativeImage of the drawn-video rect (YouTube) or the whole
+    // webview pane (non-YouTube / rect not yet measured).
+    const image = rect ? await guest.capturePage(rect) : await guest.capturePage();
     if (image.isEmpty()) return;
 
     // Scale UNIFORMLY to fit within OUT_W x OUT_H, preserving the capture's
