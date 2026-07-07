@@ -19,9 +19,16 @@ body {
   height: 100vh;
 }
 
-/* Two players side by side. */
+/* VJ bar on top, two players side by side below. */
 .app {
   height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.players {
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: row;
 }
@@ -36,6 +43,41 @@ body {
 .divider {
   width: 1px;
   background: #2b2f38;
+}
+
+/* ---- VJ bar ---- */
+.vjbar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: #12141a;
+  border-bottom: 1px solid #2b2f38;
+}
+
+.vjbar .modes {
+  display: flex;
+  gap: 8px;
+}
+
+.vjbar .vjfade {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.vjbar .ab {
+  font-weight: 700;
+  color: #aeb4c0;
+}
+
+.vjbar .fader {
+  flex: 1;
+  max-width: 520px;
+}
+
+.vjbar .statusline {
+  margin-left: auto;
 }
 
 .bar.sub {

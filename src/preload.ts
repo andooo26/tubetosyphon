@@ -27,9 +27,22 @@ export interface ChannelStatus {
   quality: Quality;
 }
 
+export type Mode = 'dual' | 'vj';
+
+export interface VjStatus {
+  running: boolean;
+  hasClients: boolean;
+  fps: number;
+  serverName: string;
+  error: string | null;
+}
+
 export interface AppStatus {
   left: ChannelStatus;
   right: ChannelStatus;
+  mode: Mode;
+  vjAlpha: number; // 0 = A (left), 1 = B (right)
+  vj: VjStatus;
 }
 
 const api = {
@@ -57,6 +70,15 @@ const api = {
     quality: Quality,
   ): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('app:set-quality', channel, quality),
+  setMode: (mode: Mode): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('app:set-mode', mode),
+  setVjAlpha: (alpha: number): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('app:set-vj-alpha', alpha),
+  fadeVjTo: (
+    target: number,
+    durationMs: number,
+  ): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('app:vj-fade', target, durationMs),
   getStatus: (): Promise<AppStatus> => ipcRenderer.invoke('app:get-status'),
   onStatus: (cb: (s: AppStatus) => void): (() => void) => {
     const listener = (_e: unknown, s: AppStatus) => cb(s);

@@ -65,7 +65,19 @@ const QUALITY_OPTIONS: { value: Quality; label: string }[] = [
   { value: 'medium', label: '360p' },
 ];
 
-const EMPTY_STATUS: AppStatus = { left: EMPTY_CHANNEL, right: EMPTY_CHANNEL };
+const EMPTY_STATUS: AppStatus = {
+  left: EMPTY_CHANNEL,
+  right: EMPTY_CHANNEL,
+  mode: 'dual',
+  vjAlpha: 0,
+  vj: {
+    running: false,
+    hasClients: false,
+    fps: 0,
+    serverName: 'TubeToSyphon',
+    error: null,
+  },
+};
 
 // mm:ss (or h:mm:ss) for the transport time labels.
 function fmtTime(sec: number): string {
@@ -89,9 +101,11 @@ interface VideoState {
 function Player({
   channel,
   status,
+  vjMode,
 }: {
   channel: ChannelId;
   status: ChannelStatus;
+  vjMode: boolean;
 }) {
   const [input, setInput] = useState('');
   const [loadedUrl, setLoadedUrl] = useState('');
@@ -261,12 +275,14 @@ function Player({
       </header>
 
       <div className="bar sub">
-        <button
-          className={status.running ? 'danger' : 'primary'}
-          onClick={toggleOutput}
-        >
-          {status.running ? 'Stop Syphon' : 'Start Syphon'}
-        </button>
+        {!vjMode && (
+          <button
+            className={status.running ? 'danger' : 'primary'}
+            onClick={toggleOutput}
+          >
+            {status.running ? 'Stop Syphon' : 'Start Syphon'}
+          </button>
+        )}
         <button onClick={toggleHideControls}>
           {status.hideControls ? 'Controls: hidden' : 'Controls: shown'}
         </button>
@@ -285,15 +301,25 @@ function Player({
         </label>
         <div className="spacer" />
         <div className="statusline">
-          <span className={`dot ${status.running ? 'on' : 'off'}`} />
-          <b>{status.serverName}</b>
+          {vjMode ? (
+            <b>{channel === 'left' ? 'A' : 'B'}</b>
+          ) : (
+            <>
+              <span className={`dot ${status.running ? 'on' : 'off'}`} />
+              <b>{status.serverName}</b>
+            </>
+          )}
           {video.vh > 0 && (
             <span title="current resolution / this video's max resolution">
               · {video.vh}p / {video.maxH > 0 ? `${video.maxH}p` : '—'}
             </span>
           )}
-          <span>· {status.fps} fps</span>
-          <span>· {status.hasClients ? 'connected' : 'no receiver'}</span>
+          {!vjMode && (
+            <>
+              <span>· {status.fps} fps</span>
+              <span>· {status.hasClients ? 'connected' : 'no receiver'}</span>
+            </>
+          )}
         </div>
       </div>
       {status.error && <div className="statusline error">{status.error}</div>}
@@ -377,6 +403,70 @@ function Player({
   );
 }
 
+// VJ crossfade + mode toggle bar. In VJ mode the two players feed one Syphon
+// output ("TubeToSyphon") blended by the A/B fader; Cut A/B jump to either end.
+function VjBar({ status }: { status: AppStatus }) {
+  const vjMode = status.mode === 'vj';
+  const vj = status.vj;
+
+  const setMode = async (mode: 'dual' | 'vj') => {
+    const res = await window.api.setMode(mode);
+    if (!res.ok && res.error) alert(res.error);
+  };
+  const setAlpha = (a: number) => window.api.setVjAlpha(a);
+  const fadeTo = (a: number) => window.api.fadeVjTo(a, 1000); // ~1s crossfade
+
+  return (
+    <div className="vjbar">
+      <div className="modes">
+        <button
+          className={vjMode ? '' : 'primary'}
+          onClick={() => setMode('dual')}
+        >
+          Dual (2 out)
+        </button>
+        <button
+          className={vjMode ? 'primary' : ''}
+          onClick={() => setMode('vj')}
+        >
+          VJ (1 out)
+        </button>
+      </div>
+
+      {vjMode && (
+        <div className="vjfade">
+          <button onClick={() => fadeTo(0)} title="Fade to A over ~1s">
+            Fade A
+          </button>
+          <span className="ab">A</span>
+          <input
+            className="fader"
+            type="range"
+            min={0}
+            max={1}
+            step={0.001}
+            value={status.vjAlpha}
+            onChange={(e) => setAlpha(Number(e.target.value))}
+          />
+          <span className="ab">B</span>
+          <button onClick={() => fadeTo(1)} title="Fade to B over ~1s">
+            Fade B
+          </button>
+          <div className="statusline">
+            <span className={`dot ${vj.running ? 'on' : 'off'}`} />
+            <b>{vj.serverName}</b>
+            <span>· {vj.fps} fps</span>
+            <span>· {vj.hasClients ? 'connected' : 'no receiver'}</span>
+          </div>
+        </div>
+      )}
+      {vjMode && vj.error && (
+        <div className="statusline error">{vj.error}</div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [status, setStatus] = useState<AppStatus>(EMPTY_STATUS);
 
@@ -386,11 +476,16 @@ export default function App() {
     return off;
   }, []);
 
+  const vjMode = status.mode === 'vj';
+
   return (
     <div className="app">
-      <Player channel="left" status={status.left} />
-      <div className="divider" />
-      <Player channel="right" status={status.right} />
+      <VjBar status={status} />
+      <div className="players">
+        <Player channel="left" status={status.left} vjMode={vjMode} />
+        <div className="divider" />
+        <Player channel="right" status={status.right} vjMode={vjMode} />
+      </div>
     </div>
   );
 }

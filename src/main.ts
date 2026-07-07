@@ -55,6 +55,7 @@ interface Channel {
   frameBuf: Uint8Array | null; // reused OUT_W*OUT_H*4 RGBA letterbox canvas (grown never shrunk)
   lbW: number; // last letterboxed video width (to know when black bars must be re-cleared)
   lbH: number; // last letterboxed video height
+  latest: Uint8Array | null; // most recent OUT_W*OUT_H RGBA frame (for the VJ mixer to blend)
 }
 
 function makeChannel(id: ChannelId, serverName: string): Channel {
@@ -81,6 +82,7 @@ function makeChannel(id: ChannelId, serverName: string): Channel {
     frameBuf: null,
     lbW: -1,
     lbH: -1,
+    latest: null,
   };
 }
 
@@ -92,6 +94,24 @@ const channels: Record<ChannelId, Channel> = {
 function getChannel(id: unknown): Channel | null {
   return id === 'left' || id === 'right' ? channels[id] : null;
 }
+
+// ---- VJ mode --------------------------------------------------------------
+// One combined Syphon output that crossfades between the two players. In 'vj'
+// mode the per-channel Syphon servers are stopped; both channels keep capturing
+// (into ch.latest) and a single mixer blends L/R by vjAlpha and publishes to one
+// server. In 'dual' mode each channel publishes to its own server as before.
+type Mode = 'dual' | 'vj';
+let mode: Mode = 'dual';
+let vjAlpha = 0; // 0 = full A (left), 1 = full B (right)
+// Active crossfade animation (Cut A/B fade over a duration instead of jumping).
+let vjAnim: { from: number; to: number; start: number; dur: number } | null = null;
+const vjSyphon = new SyphonManager('TubeToSyphon');
+let vjTimer: NodeJS.Timeout | null = null;
+let vjBuf: Uint8Array | null = null; // OUT_W*OUT_H*4 RGBA blend scratch
+let vjFramesThisSecond = 0;
+let vjLastFpsStamp = Date.now();
+let vjMeasuredFps = 0;
+const VJ_INTERVAL_MS = 16; // ~60fps output
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -350,16 +370,27 @@ function getBlackFrame(): Uint8Array {
   return blackFrame;
 }
 
-function makeRedFrame(): Uint8Array {
+let redFrame: Uint8Array | null = null;
+function getRedFrame(): Uint8Array {
   // RGBA solid red (published via publishRGBA — no swizzle).
-  const buf = new Uint8Array(OUT_W * OUT_H * 4);
-  for (let i = 0; i < buf.length; i += 4) {
-    buf[i] = 255; // R
-    buf[i + 1] = 0; // G
-    buf[i + 2] = 0; // B
-    buf[i + 3] = 255; // A
+  if (!redFrame) {
+    redFrame = new Uint8Array(OUT_W * OUT_H * 4);
+    for (let i = 0; i < redFrame.length; i += 4) {
+      redFrame[i] = 255; // R
+      redFrame[i + 3] = 255; // A
+    }
   }
-  return buf;
+  return redFrame;
+}
+
+// Route one finished OUT_W*OUT_H RGBA frame for a channel. In 'dual' mode it goes
+// straight to the channel's own Syphon server; in 'vj' mode it is just recorded
+// as ch.latest for the mixer (which publishes the blended result to one server).
+function outputChannelFrame(ch: Channel, frame: Uint8Array) {
+  ch.latest = frame;
+  if (mode === 'dual') {
+    if (ch.syphon.publishRGBA(frame, OUT_W, OUT_H)) countFrame(ch);
+  }
 }
 
 // Composite a BGRA source image (srcW*srcH) centred, at 1:1, onto a black
@@ -464,7 +495,7 @@ function onFrame(ch: Channel, image: Electron.NativeImage) {
       }
     }
     const frame = letterbox(ch, bgra, bw, bh);
-    if (ch.syphon.publishRGBA(frame, OUT_W, OUT_H)) countFrame(ch);
+    outputChannelFrame(ch, frame);
   } catch (err) {
     sendStatus({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -475,11 +506,11 @@ function onFrame(ch: Channel, image: Electron.NativeImage) {
 // the cached drawn-video rect off-thread for the frame-subscription path.
 function staticTick(ch: Channel) {
   if (ch.testFrame) {
-    if (ch.syphon.publishRGBA(makeRedFrame(), OUT_W, OUT_H)) countFrame(ch);
+    outputChannelFrame(ch, getRedFrame());
     return;
   }
   if (!ch.onWatchPage) {
-    if (ch.syphon.publishRGBA(getBlackFrame(), OUT_W, OUT_H)) countFrame(ch);
+    outputChannelFrame(ch, getBlackFrame());
     return;
   }
   // Watch page: live frames arrive via onFrame(); just keep the rect fresh.
@@ -548,6 +579,102 @@ function countFrame(ch: Channel) {
   }
 }
 
+// ---- VJ mixer -------------------------------------------------------------
+
+function countVjFrame() {
+  vjFramesThisSecond++;
+  const now = Date.now();
+  if (now - vjLastFpsStamp >= 1000) {
+    vjMeasuredFps = vjFramesThisSecond;
+    vjFramesThisSecond = 0;
+    vjLastFpsStamp = now;
+    sendStatus({});
+  }
+}
+
+// Blend two OUT_W*OUT_H RGBA frames into dst: dst = a*(1-t) + b*t.
+function blend(dst: Uint8Array, a: Uint8Array, b: Uint8Array, t: number) {
+  const it = 1 - t;
+  const n = OUT_W * OUT_H * 4;
+  for (let i = 0; i < n; i++) {
+    dst[i] = (a[i] * it + b[i] * t) | 0;
+  }
+}
+
+// Publish one mixed frame. Skips the per-pixel blend entirely at the fader ends
+// (the common "hold on A/B" case) — only a live crossfade pays the blend cost.
+function vjTick() {
+  // Advance an in-progress crossfade animation (smoothstep for an ease-in/out
+  // "slow" feel). Manual fader input cancels it (see set-vj-alpha).
+  if (vjAnim) {
+    const t = Math.min(1, (Date.now() - vjAnim.start) / vjAnim.dur);
+    const e = t * t * (3 - 2 * t); // smoothstep
+    vjAlpha = vjAnim.from + (vjAnim.to - vjAnim.from) * e;
+    if (t >= 1) {
+      vjAlpha = vjAnim.to;
+      vjAnim = null;
+    }
+    sendStatus({}); // keep the UI fader in sync during the fade
+  }
+
+  const black = getBlackFrame();
+  const L = channels.left.latest ?? black;
+  const R = channels.right.latest ?? black;
+  let out: Uint8Array;
+  if (vjAlpha <= 0.001) {
+    out = L;
+  } else if (vjAlpha >= 0.999) {
+    out = R;
+  } else {
+    if (!vjBuf || vjBuf.length < OUT_W * OUT_H * 4) {
+      vjBuf = new Uint8Array(OUT_W * OUT_H * 4);
+    }
+    blend(vjBuf, L, R, vjAlpha);
+    out = vjBuf;
+  }
+  if (vjSyphon.publishRGBA(out, OUT_W, OUT_H)) countVjFrame();
+}
+
+function startVjTimer() {
+  if (vjTimer) return;
+  vjLastFpsStamp = Date.now();
+  vjFramesThisSecond = 0;
+  vjTimer = setInterval(vjTick, VJ_INTERVAL_MS);
+}
+
+function stopVjTimer() {
+  if (vjTimer) {
+    clearInterval(vjTimer);
+    vjTimer = null;
+  }
+  vjMeasuredFps = 0;
+}
+
+// Switch between 'dual' and 'vj'. Entering VJ stops the per-channel servers,
+// starts the single mixed server, and makes sure both channels are capturing.
+// Leaving VJ tears the mixer down and stops capture (dual outputs start on demand).
+function setMode(next: Mode): { ok: boolean; error?: string } {
+  if (next === mode) return { ok: true };
+  if (next === 'vj') {
+    // Only one Syphon output in VJ mode: stop the two per-channel servers.
+    for (const ch of Object.values(channels)) {
+      stopCapture(ch);
+      ch.syphon.dispose();
+    }
+    if (!vjSyphon.start()) return { ok: false, error: vjSyphon.error ?? 'vj start failed' };
+    mode = 'vj';
+    for (const ch of Object.values(channels)) startCapture(ch);
+    startVjTimer();
+  } else {
+    stopVjTimer();
+    vjSyphon.dispose();
+    for (const ch of Object.values(channels)) stopCapture(ch);
+    mode = 'dual';
+  }
+  sendStatus({});
+  return { ok: true };
+}
+
 function startCapture(ch: Channel) {
   if (ch.captureTimer) return;
   ch.lastFpsStamp = Date.now();
@@ -587,6 +714,15 @@ function appStatus() {
   return {
     left: channelStatus(channels.left),
     right: channelStatus(channels.right),
+    mode,
+    vjAlpha,
+    vj: {
+      running: vjSyphon.isRunning,
+      hasClients: vjSyphon.hasClients,
+      fps: vjMeasuredFps,
+      serverName: 'TubeToSyphon',
+      error: vjSyphon.error,
+    },
   };
 }
 
@@ -624,6 +760,7 @@ ipcMain.handle(
 ipcMain.handle('app:start-output', (_e, channelId: ChannelId) => {
   const ch = getChannel(channelId);
   if (!ch) return { ok: false, error: 'unknown channel' };
+  if (mode === 'vj') return { ok: false, error: 'switch to Dual mode first' };
   if (!ch.syphon.start()) {
     return { ok: false, error: ch.syphon.error };
   }
@@ -693,11 +830,45 @@ ipcMain.handle(
   },
 );
 
+ipcMain.handle('app:set-mode', (_e, next: Mode) => {
+  if (next !== 'dual' && next !== 'vj') return { ok: false, error: 'bad mode' };
+  return setMode(next);
+});
+
+ipcMain.handle('app:set-vj-alpha', (_e, alpha: number) => {
+  if (typeof alpha !== 'number' || !isFinite(alpha)) {
+    return { ok: false, error: 'bad alpha' };
+  }
+  vjAnim = null; // manual fader wins; cancel any running fade
+  vjAlpha = Math.min(1, Math.max(0, alpha));
+  sendStatus({});
+  return { ok: true };
+});
+
+// Animate the crossfade to `target` over `durationMs` (Cut A/B use ~1s).
+ipcMain.handle('app:vj-fade', (_e, target: number, durationMs: number) => {
+  if (typeof target !== 'number' || !isFinite(target)) {
+    return { ok: false, error: 'bad target' };
+  }
+  const to = Math.min(1, Math.max(0, target));
+  const dur = typeof durationMs === 'number' && durationMs > 0 ? durationMs : 0;
+  if (dur === 0) {
+    vjAnim = null;
+    vjAlpha = to;
+  } else {
+    vjAnim = { from: vjAlpha, to, start: Date.now(), dur };
+  }
+  sendStatus({});
+  return { ok: true };
+});
+
 ipcMain.handle('app:get-status', () => appStatus());
 
 app.on('ready', createWindow);
 
 app.on('window-all-closed', () => {
+  stopVjTimer();
+  vjSyphon.dispose();
   for (const ch of Object.values(channels)) {
     stopCapture(ch);
     ch.syphon.dispose();
