@@ -61,6 +61,24 @@ body {
   flex: 1;
 }
 
+.quality {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #aeb4c0;
+}
+
+.quality select {
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #333844;
+  background: #262b34;
+  color: #e7e9ee;
+  font-size: 13px;
+  cursor: pointer;
+}
+
 .url {
   flex: 1;
   min-width: 200px;

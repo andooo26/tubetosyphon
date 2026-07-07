@@ -2,6 +2,19 @@ import { contextBridge, ipcRenderer, clipboard } from 'electron';
 
 export type ChannelId = 'left' | 'right';
 
+// YouTube playback-quality target. 'auto' lets YouTube's ABR decide; 'highest'
+// forces the best available; the rest are YouTube's own quality-level ids and
+// mean "best available at or below this level".
+export type Quality =
+  | 'auto'
+  | 'highest'
+  | 'hd2160'
+  | 'hd1440'
+  | 'hd1080'
+  | 'hd720'
+  | 'large'
+  | 'medium';
+
 export interface ChannelStatus {
   running: boolean;
   capturing: boolean;
@@ -11,6 +24,7 @@ export interface ChannelStatus {
   error: string | null;
   testFrame: boolean;
   hideControls: boolean;
+  quality: Quality;
 }
 
 export interface AppStatus {
@@ -38,6 +52,11 @@ const api = {
     on: boolean,
   ): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('app:set-hide-controls', channel, on),
+  setQuality: (
+    channel: ChannelId,
+    quality: Quality,
+  ): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('app:set-quality', channel, quality),
   getStatus: (): Promise<AppStatus> => ipcRenderer.invoke('app:get-status'),
   onStatus: (cb: (s: AppStatus) => void): (() => void) => {
     const listener = (_e: unknown, s: AppStatus) => cb(s);

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type { AppStatus, ChannelId, ChannelStatus } from './preload';
+import type { AppStatus, ChannelId, ChannelStatus, Quality } from './preload';
 
 /** True if the input looks like a URL (has a scheme or a bare domain), rather
  * than a free-text search query. */
@@ -50,7 +50,20 @@ const EMPTY_CHANNEL: ChannelStatus = {
   error: null,
   testFrame: false,
   hideControls: true,
+  quality: 'highest',
 };
+
+// UI label -> YouTube quality target (see Quality in preload).
+const QUALITY_OPTIONS: { value: Quality; label: string }[] = [
+  { value: 'highest', label: 'Max' },
+  { value: 'auto', label: 'Auto' },
+  { value: 'hd2160', label: '2160p' },
+  { value: 'hd1440', label: '1440p' },
+  { value: 'hd1080', label: '1080p' },
+  { value: 'hd720', label: '720p' },
+  { value: 'large', label: '480p' },
+  { value: 'medium', label: '360p' },
+];
 
 const EMPTY_STATUS: AppStatus = { left: EMPTY_CHANNEL, right: EMPTY_CHANNEL };
 
@@ -198,6 +211,11 @@ function Player({
     if (!res.ok && res.error) alert(res.error);
   };
 
+  const changeQuality = async (q: Quality) => {
+    const res = await window.api.setQuality(channel, q);
+    if (!res.ok && res.error) alert(res.error);
+  };
+
   const toggleHideControls = async () => {
     const res = await window.api.setHideControls(channel, !status.hideControls);
     if (!res.ok && res.error) alert(res.error);
@@ -252,6 +270,19 @@ function Player({
         <button onClick={toggleHideControls}>
           {status.hideControls ? 'Controls: hidden' : 'Controls: shown'}
         </button>
+        <label className="quality" title="YouTube playback quality">
+          Quality:
+          <select
+            value={status.quality}
+            onChange={(e) => changeQuality(e.target.value as Quality)}
+          >
+            {QUALITY_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </label>
         <div className="spacer" />
         <div className="statusline">
           <span className={`dot ${status.running ? 'on' : 'off'}`} />

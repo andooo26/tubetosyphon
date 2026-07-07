@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, webContents } from 'electron';
 import path from 'node:path';
 import started from 'electron-squirrel-startup';
 import { SyphonManager } from './syphon';
+import type { Quality } from './preload';
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (started) {
@@ -11,8 +12,10 @@ if (started) {
 // ---- Output constants (spec: 1080p fixed, ~60fps) -------------------------
 const OUT_W = 1920;
 const OUT_H = 1080;
-const TARGET_FPS = 60;
-const FRAME_INTERVAL_MS = Math.round(1000 / TARGET_FPS);
+// Live frames are pushed by beginFrameSubscription at the compositor's paint
+// cadence (up to display refresh). This slow timer only drives the generated
+// static frames (red test / black-while-browsing) and the video-rect refresh.
+const STATIC_TICK_MS = 150;
 
 // ---- Channels (two independent players: left + right) ---------------------
 // Each channel drives its own <webview> guest, its own Syphon server, and its
@@ -26,17 +29,32 @@ interface Channel {
   guestContentsId: number | null;
   onWatchPage: boolean; // capture real video? false only on a YouTube browse page (-> black).
   isYouTube: boolean; // current guest page is YouTube (video fills the viewport via our CSS).
-  videoRect: { x: number; y: number; width: number; height: number } | null; // drawn-video region to capture
+  // Drawn-video region to capture, in guest CSS px, plus the viewport CSS size it
+  // was measured against (so onFrame can rescale it to the subscription image's
+  // device-pixel dimensions — Retina makes them differ).
+  videoRect: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    viewW: number;
+    viewH: number;
+  } | null;
   videoRectStamp: number; // when videoRect was last measured (throttle the JS round-trip)
-  captureTimer: NodeJS.Timeout | null;
+  captureTimer: NodeJS.Timeout | null; // slow timer: static (red/black) frames + rect refresh
+  subscribedContentsId: number | null; // guest we've called beginFrameSubscription on
+  rectRefreshing: boolean; // a VIDEO_RECT_JS round-trip is in flight
   inFlight: boolean; // capturePage is async; skip a tick if the last is still running.
   testFrame: boolean; // publish a solid red frame instead of the webview.
   hideControls: boolean; // hide YouTube's playback bar + captions.
+  quality: Quality; // target YouTube playback quality (re-asserted by the injected JS).
   hideCssKey: string | null; // insertCSS key for the CURRENT page (invalidated on navigation).
   framesThisSecond: number;
   lastFpsStamp: number;
   measuredFps: number;
-  frameBuf: Uint8Array | null; // reused OUT_W*OUT_H*4 letterbox canvas (grown never shrunk)
+  frameBuf: Uint8Array | null; // reused OUT_W*OUT_H*4 RGBA letterbox canvas (grown never shrunk)
+  lbW: number; // last letterboxed video width (to know when black bars must be re-cleared)
+  lbH: number; // last letterboxed video height
 }
 
 function makeChannel(id: ChannelId, serverName: string): Channel {
@@ -50,14 +68,19 @@ function makeChannel(id: ChannelId, serverName: string): Channel {
     videoRect: null,
     videoRectStamp: 0,
     captureTimer: null,
+    subscribedContentsId: null,
+    rectRefreshing: false,
     inFlight: false,
     testFrame: false,
     hideControls: true,
+    quality: 'highest',
     hideCssKey: null,
     framesThisSecond: 0,
     lastFpsStamp: Date.now(),
     measuredFps: 0,
     frameBuf: null,
+    lbW: -1,
+    lbH: -1,
   };
 }
 
@@ -186,16 +209,33 @@ const AD_SKIP_JS = `
         if (mp && mp.setOption) mp.setOption('captions', 'track', {});
         if (mp && mp.unloadModule) mp.unloadModule('captions');
       } catch (e) {}
-      // Force the highest available playback quality. YouTube may downgrade on
-      // its own (bandwidth/ABR), so we keep re-asserting it every tick.
+      // Enforce the target playback quality (set via window.__u2s_targetQuality
+      // from the UI). YouTube may downgrade on its own (ABR), so we re-assert it
+      // every tick. 'auto' means leave YouTube's ABR alone.
       try {
-        var p = document.getElementById('movie_player');
-        if (p && p.getAvailableQualityLevels) {
-          var levels = p.getAvailableQualityLevels();
-          if (levels && levels.length) {
-            var best = levels[0]; // array is ordered highest -> lowest
-            if (p.setPlaybackQualityRange) p.setPlaybackQualityRange(best, best);
-            if (p.setPlaybackQuality) p.setPlaybackQuality(best);
+        var target = window.__u2s_targetQuality || 'highest';
+        if (target !== 'auto') {
+          var p = document.getElementById('movie_player');
+          if (p && p.getAvailableQualityLevels) {
+            var levels = p.getAvailableQualityLevels(); // highest -> lowest, no 'auto'
+            if (levels && levels.length) {
+              var order = ['highres','hd2160','hd1440','hd1080','hd720','large','medium','small','tiny'];
+              var pick;
+              if (target === 'highest') {
+                pick = levels[0];
+              } else {
+                var ti = order.indexOf(target);
+                // best available AT OR BELOW the target (levels is highest-first).
+                for (var i = 0; i < levels.length; i++) {
+                  if (order.indexOf(levels[i]) >= ti) { pick = levels[i]; break; }
+                }
+                if (!pick) pick = levels[levels.length - 1]; // only higher exist -> lowest available
+              }
+              if (pick) {
+                if (p.setPlaybackQualityRange) p.setPlaybackQualityRange(pick, pick);
+                if (p.setPlaybackQuality) p.setPlaybackQuality(pick);
+              }
+            }
           }
         }
       } catch (e) {}
@@ -220,7 +260,8 @@ const VIDEO_RECT_JS = `
     if (vAR > eAR) { w = elW; h = elW / vAR; } else { h = elH; w = elH * vAR; }
     return {
       x: Math.round((elW - w) / 2), y: Math.round((elH - h) / 2),
-      width: Math.round(w), height: Math.round(h)
+      width: Math.round(w), height: Math.round(h),
+      viewW: elW, viewH: elH
     };
   })()
 `;
@@ -237,6 +278,8 @@ function setupYouTubeCleanup(guest: Electron.WebContents, ch: Channel) {
     ch.videoRect = null;
     ch.videoRectStamp = 0;
     if (!isYouTube) return;
+    // Seed the target quality before the injected interval starts reading it.
+    pushQuality(ch);
     // The persistent-<style> injector (AD_SKIP_JS) applies/removes the
     // "video only" layout itself based on the live URL, so it self-heals across
     // SPA navigations and never leaks onto browse pages. No eager insertCSS here.
@@ -256,6 +299,20 @@ function setupYouTubeCleanup(guest: Electron.WebContents, ch: Channel) {
   // YouTube is a SPA; re-apply on in-page navigations too.
   guest.on('did-navigate-in-page', apply);
   guest.on('did-navigate', apply);
+}
+
+// Push the channel's target quality into its guest. The injected interval reads
+// window.__u2s_targetQuality every tick and re-asserts it, so this takes effect
+// live (no reload) and survives ABR downgrades.
+function pushQuality(ch: Channel) {
+  if (ch.guestContentsId == null) return;
+  const guest = webContents.fromId(ch.guestContentsId);
+  if (!guest || guest.isDestroyed()) return;
+  guest
+    .executeJavaScript(
+      `window.__u2s_targetQuality=${JSON.stringify(ch.quality)};`,
+    )
+    .catch((): void => {});
 }
 
 const createWindow = () => {
@@ -294,110 +351,106 @@ function getBlackFrame(): Uint8Array {
 }
 
 function makeRedFrame(): Uint8Array {
-  // BGRA solid red (SyphonManager swizzles BGRA->RGBA).
+  // RGBA solid red (published via publishRGBA — no swizzle).
   const buf = new Uint8Array(OUT_W * OUT_H * 4);
   for (let i = 0; i < buf.length; i += 4) {
-    buf[i] = 0; // B
+    buf[i] = 255; // R
     buf[i + 1] = 0; // G
-    buf[i + 2] = 255; // R
+    buf[i + 2] = 0; // B
     buf[i + 3] = 255; // A
   }
   return buf;
 }
 
 // Composite a BGRA source image (srcW*srcH) centred, at 1:1, onto a black
-// OUT_W*OUT_H BGRA canvas. The source is assumed to already be scaled to fit
-// within the canvas (see captureTick). Rows/cols are clamped so an unexpectedly
-// large source (e.g. a Retina scaleFactor slip) can never overrun the canvas.
+// OUT_W*OUT_H canvas, converting BGRA->RGBA in the SAME pass so the result is
+// ready to publish without a second full-buffer swizzle. The black bars are only
+// re-cleared when the video geometry changes (they are otherwise untouched from
+// the previous frame), so a steady-state frame does exactly one pass over just
+// the video pixels. Rows/cols are clamped so an unexpectedly large source (e.g.
+// a Retina scaleFactor slip) can never overrun the canvas.
 function letterbox(ch: Channel, src: Uint8Array, srcW: number, srcH: number): Uint8Array {
   const size = OUT_W * OUT_H * 4;
-  if (!ch.frameBuf || ch.frameBuf.length < size) ch.frameBuf = new Uint8Array(size);
+  let cleared = false;
+  if (!ch.frameBuf || ch.frameBuf.length < size) {
+    ch.frameBuf = new Uint8Array(size);
+    cleared = true; // fresh buffer needs its bars painted
+  }
   const canvas = ch.frameBuf;
-  // Opaque black bars (BGRA 0,0,0,255) so receivers that respect alpha still
-  // see solid black letterboxing, not transparency.
-  canvas.fill(0);
-  for (let i = 3; i < size; i += 4) canvas[i] = 255;
 
   const w = Math.min(srcW, OUT_W);
   const h = Math.min(srcH, OUT_H);
-  const offX = ((OUT_W - w) >> 1);
-  const offY = ((OUT_H - h) >> 1);
+  // Re-paint the opaque-black bars (RGBA 0,0,0,255) only when the video region
+  // changed shape; otherwise last frame's bars are already correct.
+  if (!cleared && (w !== ch.lbW || h !== ch.lbH)) cleared = true;
+  if (cleared) {
+    canvas.fill(0);
+    for (let i = 3; i < size; i += 4) canvas[i] = 255;
+    ch.lbW = w;
+    ch.lbH = h;
+  }
+
+  const offX = (OUT_W - w) >> 1;
+  const offY = (OUT_H - h) >> 1;
   const srcStride = srcW * 4;
   const dstStride = OUT_W * 4;
   for (let y = 0; y < h; y++) {
-    const srcRow = y * srcStride;
-    const dstRow = (offY + y) * dstStride + offX * 4;
-    canvas.set(src.subarray(srcRow, srcRow + w * 4), dstRow);
+    let s = y * srcStride;
+    let d = (offY + y) * dstStride + offX * 4;
+    for (let x = 0; x < w; x++) {
+      canvas[d] = src[s + 2]; // R <- B
+      canvas[d + 1] = src[s + 1]; // G
+      canvas[d + 2] = src[s]; // B <- R
+      canvas[d + 3] = 255; // A (opaque; source alpha is always 255 here)
+      s += 4;
+      d += 4;
+    }
   }
   return canvas;
 }
 
-async function captureTick(ch: Channel) {
-  if (ch.inFlight) return;
-  ch.inFlight = true;
+// Process ONE painted frame delivered by beginFrameSubscription. `image` is the
+// full webview surface; we crop to the drawn-video rect (avoids double
+// letterboxing), scale-to-fit + letterbox onto 1920x1080, and publish. Fully
+// synchronous — no capturePage round-trip, so it runs at the compositor's paint
+// cadence instead of stalling on polled GPU readbacks.
+function onFrame(ch: Channel, image: Electron.NativeImage) {
+  // Static modes (test pattern / browsing) are driven by the slow timer so they
+  // work even when the page isn't painting; ignore live paints for them.
+  if (ch.testFrame || !ch.onWatchPage) return;
   try {
-    if (ch.testFrame) {
-      ch.syphon.publishBGRA(makeRedFrame(), OUT_W, OUT_H);
-      countFrame(ch);
-      return;
-    }
-
-    if (ch.guestContentsId == null) return;
-    const guest = webContents.fromId(ch.guestContentsId);
-    if (!guest || guest.isDestroyed()) {
-      ch.guestContentsId = null;
-      return;
-    }
-
-    // Browsing YouTube (home/search/channel) — output black, not the page UI.
-    if (!ch.onWatchPage) {
-      if (ch.syphon.publishBGRA(getBlackFrame(), OUT_W, OUT_H)) countFrame(ch);
-      return;
-    }
-
-    // On YouTube our CSS makes the <video> fill the viewport (object-fit:contain),
-    // so the pane contains letterbox bars around the video. Capture ONLY the drawn
-    // video rectangle to avoid double letterboxing (bars from the pane + bars from
-    // our 1080p fit). Re-measure at most ~2x/sec; reuse the cached rect otherwise.
-    let rect = ch.videoRect;
-    if (ch.isYouTube) {
-      const now = Date.now();
-      if (!rect || now - ch.videoRectStamp > 500) {
-        try {
-          const r = (await guest.executeJavaScript(VIDEO_RECT_JS)) as
-            | { x: number; y: number; width: number; height: number }
-            | null;
-          ch.videoRect =
-            r && r.width > 0 && r.height > 0 ? r : null;
-          ch.videoRectStamp = now;
-          rect = ch.videoRect;
-        } catch {
-          /* keep the previous rect */
-        }
-      }
-    } else {
-      rect = null;
-    }
-
-    // capturePage() -> NativeImage of the drawn-video rect (YouTube) or the whole
-    // webview pane (non-YouTube / rect not yet measured).
-    const image = rect ? await guest.capturePage(rect) : await guest.capturePage();
     if (image.isEmpty()) return;
 
-    // Scale UNIFORMLY to fit within OUT_W x OUT_H, preserving the capture's
-    // aspect ratio, then letterbox onto a fixed 1920x1080 canvas. The webview
-    // pane is NOT 16:9 (it fills a flex area), so force-resizing to 1920x1080
-    // used to stretch the video horizontally — the classic "動画によって横長"
-    // bug. Uniform scale + letterbox keeps every video at correct proportions.
-    const src = image.getSize();
+    // On YouTube our CSS makes the <video> fill the viewport (object-fit:contain),
+    // so crop to ONLY the drawn video rectangle (measured off-thread, cached on
+    // ch.videoRect). Clamp to the surface bounds so a stale rect can't overrun.
+    let img = image;
+    const full = image.getSize();
+    const rect = ch.isYouTube ? ch.videoRect : null;
+    if (rect && rect.viewW > 0 && rect.viewH > 0) {
+      // The subscription image is in device px (Retina => 2x the CSS px the rect
+      // was measured in). Rescale the rect by the image/viewport ratio so the crop
+      // lands on the real video region, not a corner of it.
+      const sx = full.width / rect.viewW;
+      const sy = full.height / rect.viewH;
+      const x = Math.max(0, Math.min(Math.round(rect.x * sx), full.width - 1));
+      const y = Math.max(0, Math.min(Math.round(rect.y * sy), full.height - 1));
+      const w = Math.max(1, Math.min(Math.round(rect.width * sx), full.width - x));
+      const h = Math.max(1, Math.min(Math.round(rect.height * sy), full.height - y));
+      img = image.crop({ x, y, width: w, height: h });
+    }
+
+    // Scale UNIFORMLY to fit within OUT_W x OUT_H, preserving aspect ratio, then
+    // letterbox onto the fixed 1920x1080 canvas (keeps every video at correct
+    // proportions regardless of the source's aspect).
+    const src = img.getSize();
     if (src.width <= 0 || src.height <= 0) return;
     const scale = Math.min(OUT_W / src.width, OUT_H / src.height);
     const dw = Math.max(1, Math.round(src.width * scale));
     const dh = Math.max(1, Math.round(src.height * scale));
-    const resized = image.resize({ width: dw, height: dh, quality: 'good' });
-    // toBitmap() returns a BGRA buffer (getBitmap is a mistyped legacy alias).
-    // Force scaleFactor 1.0 so the buffer is exactly dw*dh px regardless of the
-    // display's Retina scale factor.
+    const resized = img.resize({ width: dw, height: dh, quality: 'good' });
+    // toBitmap() returns BGRA. Force scaleFactor 1.0 so the buffer is exactly
+    // dw*dh px regardless of the display's Retina scale factor.
     const bgra = resized.toBitmap({ scaleFactor: 1.0 });
     // Guard against a scaleFactor slip: derive the true pixel size from length.
     const px = bgra.length / 4;
@@ -411,13 +464,77 @@ async function captureTick(ch: Channel) {
       }
     }
     const frame = letterbox(ch, bgra, bw, bh);
-    if (ch.syphon.publishBGRA(frame, OUT_W, OUT_H)) countFrame(ch);
+    if (ch.syphon.publishRGBA(frame, OUT_W, OUT_H)) countFrame(ch);
   } catch (err) {
-    // Don't kill the loop on a transient capture error; surface it.
     sendStatus({ error: err instanceof Error ? err.message : String(err) });
-  } finally {
-    ch.inFlight = false;
   }
+}
+
+// Slow timer (~STATIC_TICK_MS): publishes the generated static frames (red test
+// pattern, black while browsing) which have no paints to ride on, and refreshes
+// the cached drawn-video rect off-thread for the frame-subscription path.
+function staticTick(ch: Channel) {
+  if (ch.testFrame) {
+    if (ch.syphon.publishRGBA(makeRedFrame(), OUT_W, OUT_H)) countFrame(ch);
+    return;
+  }
+  if (!ch.onWatchPage) {
+    if (ch.syphon.publishRGBA(getBlackFrame(), OUT_W, OUT_H)) countFrame(ch);
+    return;
+  }
+  // Watch page: live frames arrive via onFrame(); just keep the rect fresh.
+  if (ch.isYouTube) refreshVideoRect(ch);
+}
+
+// Measure the drawn-video rect in the guest (throttled ~2x/sec) and cache it for
+// onFrame() to crop with. Fire-and-forget so it never blocks a paint.
+function refreshVideoRect(ch: Channel) {
+  const now = Date.now();
+  if (ch.rectRefreshing || (ch.videoRect && now - ch.videoRectStamp < 500)) return;
+  if (ch.guestContentsId == null) return;
+  const guest = webContents.fromId(ch.guestContentsId);
+  if (!guest || guest.isDestroyed()) return;
+  ch.rectRefreshing = true;
+  ch.videoRectStamp = now;
+  guest
+    .executeJavaScript(VIDEO_RECT_JS)
+    .then((r: Channel['videoRect']) => {
+      ch.videoRect = r && r.width > 0 && r.height > 0 ? r : null;
+    })
+    .catch(() => {
+      /* keep the previous rect */
+    })
+    .finally(() => {
+      ch.rectRefreshing = false;
+    });
+}
+
+// ---- Frame subscription (per channel) -------------------------------------
+
+function subscribeGuest(ch: Channel) {
+  if (ch.guestContentsId == null) return;
+  if (ch.subscribedContentsId === ch.guestContentsId) return;
+  unsubscribeGuest(ch); // drop any stale subscription first
+  const guest = webContents.fromId(ch.guestContentsId);
+  if (!guest || guest.isDestroyed()) return;
+  try {
+    // onlyDirty=false: deliver full frames so a crop always has complete pixels.
+    guest.beginFrameSubscription(false, (image) => onFrame(ch, image));
+    ch.subscribedContentsId = ch.guestContentsId;
+  } catch (err) {
+    sendStatus({ error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+function unsubscribeGuest(ch: Channel) {
+  if (ch.subscribedContentsId == null) return;
+  const guest = webContents.fromId(ch.subscribedContentsId);
+  try {
+    guest?.endFrameSubscription();
+  } catch {
+    /* guest already gone */
+  }
+  ch.subscribedContentsId = null;
 }
 
 function countFrame(ch: Channel) {
@@ -435,7 +552,10 @@ function startCapture(ch: Channel) {
   if (ch.captureTimer) return;
   ch.lastFpsStamp = Date.now();
   ch.framesThisSecond = 0;
-  ch.captureTimer = setInterval(() => captureTick(ch), FRAME_INTERVAL_MS);
+  // Live frames come from the frame subscription; the timer only drives static
+  // frames + rect refresh.
+  ch.captureTimer = setInterval(() => staticTick(ch), STATIC_TICK_MS);
+  subscribeGuest(ch);
 }
 
 function stopCapture(ch: Channel) {
@@ -443,6 +563,7 @@ function stopCapture(ch: Channel) {
     clearInterval(ch.captureTimer);
     ch.captureTimer = null;
   }
+  unsubscribeGuest(ch);
   ch.measuredFps = 0;
 }
 
@@ -458,6 +579,7 @@ function channelStatus(ch: Channel) {
     error: ch.syphon.error,
     testFrame: ch.testFrame,
     hideControls: ch.hideControls,
+    quality: ch.quality,
   };
 }
 
@@ -492,6 +614,9 @@ ipcMain.handle(
     if (!guest || guest.isDestroyed()) return { ok: false };
     ch.guestContentsId = contentsId;
     setupYouTubeCleanup(guest, ch);
+    // If capture is already running, (re)attach the frame subscription to the
+    // new guest webContents.
+    if (ch.captureTimer) subscribeGuest(ch);
     return { ok: true };
   },
 );
@@ -551,6 +676,18 @@ ipcMain.handle(
         }
       }
     }
+    sendStatus({});
+    return { ok: true };
+  },
+);
+
+ipcMain.handle(
+  'app:set-quality',
+  (_e, channelId: ChannelId, quality: Quality) => {
+    const ch = getChannel(channelId);
+    if (!ch) return { ok: false, error: 'unknown channel' };
+    ch.quality = quality;
+    pushQuality(ch); // takes effect live; the injected interval re-asserts it
     sendStatus({});
     return { ok: true };
   },

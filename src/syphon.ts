@@ -132,6 +132,31 @@ export class SyphonManager {
       }
     }
 
+    return this.uploadRGBA(out, width, height, expected);
+  }
+
+  /**
+   * Publish a frame that is ALREADY in RGBA order — no swizzle pass. The capture
+   * loop swizzles inline while it letterboxes (one combined pass instead of a
+   * separate full-buffer BGRA->RGBA scan), so it uses this to skip the redundant
+   * work. Big win when compositing two 1080p channels on the main thread.
+   */
+  publishRGBA(rgba: Uint8Array, width: number, height: number): boolean {
+    if (!this.server) return false;
+    const expected = width * height * 4;
+    if (rgba.length < expected) {
+      this.lastError = `Frame buffer too small: got ${rgba.length}, need ${expected}`;
+      return false;
+    }
+    return this.uploadRGBA(rgba, width, height, expected);
+  }
+
+  private uploadRGBA(
+    out: Uint8Array,
+    width: number,
+    height: number,
+    expected: number,
+  ): boolean {
     try {
       this.server.publishImageData(
         new Uint8ClampedArray(out.buffer, out.byteOffset, expected),
