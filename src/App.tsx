@@ -1,11 +1,21 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { AppStatus, ChannelId, ChannelStatus } from './preload';
 
+/** True if the input looks like a URL (has a scheme or a bare domain), rather
+ * than a free-text search query. */
+function looksLikeUrl(s: string): boolean {
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) return true; // http://, https://, file://…
+  // Bare domain like "youtu.be/…", "example.com/…" (no spaces, has a dotted host).
+  return !/\s/.test(s) && /^[^\s/]+\.[^\s/]+/.test(s);
+}
+
 /**
- * Normalise a pasted URL. We deliberately use the normal **watch page**, not the
- * /embed/ player: many videos have embedding disabled by the owner and the embed
- * player then fails with "Error 153 / 150". The watch page has no such
- * restriction. Any non-YouTube URL is loaded as-is.
+ * Normalise the search-bar input into something loadable:
+ *  - A YouTube video URL -> the normal **watch page** (not /embed/: many videos
+ *    have embedding disabled and the embed player fails with "Error 153/150";
+ *    the watch page has no such restriction).
+ *  - Any other URL -> loaded as-is.
+ *  - Free text (not a URL) -> a YouTube **search** so the user can pick a video.
  */
 function toPlayableUrl(raw: string): string {
   const url = raw.trim();
@@ -17,7 +27,12 @@ function toPlayableUrl(raw: string): string {
   if (yt) {
     return `https://www.youtube.com/watch?v=${yt[1]}`;
   }
-  return url;
+  if (looksLikeUrl(url)) {
+    // Add a scheme if it's a bare domain so the webview loads it correctly.
+    return /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`;
+  }
+  // Free-text query -> YouTube search results page.
+  return `https://www.youtube.com/results?search_query=${encodeURIComponent(url)}`;
 }
 
 // Present a normal desktop Chrome UA so YouTube serves the full player (some
@@ -127,13 +142,35 @@ function Player({
     return () => clearInterval(id);
   }, []);
 
+  // Navigate the guest webview through a SINGLE source of truth: the imperative
+  // loadURL (with a src-attribute fallback before the guest is attached). Do NOT
+  // also bind the `src` prop — mixing the two fires two navigations that race to
+  // the same URL and the first aborts with ERR_ABORTED (-3). loadURL also
+  // re-navigates to an identical URL, so e.g. "YouTube" works after in-app browsing.
+  const navigate = (url: string) => {
+    setLoadedUrl(url);
+    const wv = webviewRef.current as unknown as {
+      loadURL?: (u: string) => Promise<void>;
+      getWebContentsId?: () => number;
+      src?: string;
+    } | null;
+    if (!wv) return;
+    let attached = false;
+    try {
+      attached = typeof wv.getWebContentsId === 'function' && wv.getWebContentsId() > 0;
+    } catch {
+      attached = false;
+    }
+    if (attached && typeof wv.loadURL === 'function') {
+      wv.loadURL(url).catch(() => {});
+    } else {
+      wv.src = url; // initial load before the guest webContents exists
+    }
+  };
+
   const play = () => {
     if (!input.trim()) return;
-    const url = toPlayableUrl(input);
-    setLoadedUrl(url);
-    if (webviewRef.current) {
-      (webviewRef.current as unknown as { src: string }).src = url;
-    }
+    navigate(toPlayableUrl(input));
   };
 
   const paste = () => {
@@ -144,13 +181,7 @@ function Player({
   // Open YouTube's home page inside the webview so the user can search + pick a
   // video in-app. Browse pages keep the full YouTube UI; once a video's watch
   // page opens, the main process auto-collapses it to "video only".
-  const browseYouTube = () => {
-    const url = 'https://www.youtube.com';
-    setLoadedUrl(url);
-    if (webviewRef.current) {
-      (webviewRef.current as unknown as { src: string }).src = url;
-    }
-  };
+  const browseYouTube = () => navigate('https://www.youtube.com');
 
   const goBack = () => {
     const wv = webviewRef.current as unknown as {
@@ -200,7 +231,7 @@ function Player({
         <button onClick={browseYouTube}>YouTube</button>
         <input
           className="url"
-          placeholder="Paste a YouTube (or any) URL…"
+          placeholder="Search YouTube, or paste a URL…"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && play()}
@@ -239,7 +270,6 @@ function Player({
       <div className="stage">
         <webview
           ref={webviewRef as React.Ref<HTMLElement>}
-          src={loadedUrl || undefined}
           partition={`persist:player-${channel}`}
           useragent={DESKTOP_UA}
           className="webview"
