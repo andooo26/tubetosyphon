@@ -24,6 +24,7 @@ interface Channel {
   readonly serverName: string;
   readonly syphon: SyphonManager;
   guestContentsId: number | null;
+  onWatchPage: boolean; // capture real video? false only on a YouTube browse page (-> black).
   captureTimer: NodeJS.Timeout | null;
   inFlight: boolean; // capturePage is async; skip a tick if the last is still running.
   testFrame: boolean; // publish a solid red frame instead of the webview.
@@ -41,6 +42,7 @@ function makeChannel(id: ChannelId, serverName: string): Channel {
     serverName,
     syphon: new SyphonManager(serverName),
     guestContentsId: null,
+    onWatchPage: false,
     captureTimer: null,
     inFlight: false,
     testFrame: false,
@@ -63,6 +65,14 @@ function getChannel(id: unknown): Channel | null {
 }
 
 let mainWindow: BrowserWindow | null = null;
+
+// A YouTube *playback* URL (watch / shorts / youtu.be) as opposed to a browse
+// page (home, search results, channel). Only playback pages get the
+// "video only" treatment + real Syphon output; browse pages stay full-UI and
+// output black so the user can navigate in-app without leaking the page.
+function isWatchUrl(url: string): boolean {
+  return /youtube\.com\/watch|youtube\.com\/shorts\/|youtu\.be\//.test(url);
+}
 
 // ---- YouTube "video only" + best-effort ad handling -----------------------
 // Injected into the guest <webview> on every navigation. CSS collapses the
@@ -110,11 +120,45 @@ const CHROME_HIDE_CSS = `
   }
 `;
 
+// Player-only CSS re-asserted from JS. insertCSS (below) is the fast path, but
+// on a fresh watch-page load the single insertion sometimes lands on the wrong
+// navigation event (YouTube is a SPA that re-navigates in-page + rebuilds the
+// DOM), so ~1 load in N the full page chrome slips through. Injecting the same
+// rules as a persistent <style> that the interval re-adds if missing makes the
+// "video only" layout self-healing regardless of navigation timing.
+const PLAYER_ONLY_JS_LITERAL = JSON.stringify(PLAYER_ONLY_CSS);
+
 const AD_SKIP_JS = `
   (function () {
     if (window.__u2s_adskip) return;
     window.__u2s_adskip = true;
+    var PLAYER_ONLY_CSS = ${PLAYER_ONLY_JS_LITERAL};
+    function isWatchPage() {
+      return /youtube\\.com\\/watch|youtube\\.com\\/shorts\\/|youtu\\.be\\//.test(location.href);
+    }
+    function ensurePlayerOnlyStyle() {
+      var el = document.getElementById('__u2s_player_only');
+      // On browse pages (home/search/channel) leave the full YouTube UI intact
+      // so the user can navigate; only collapse to "video only" on watch pages.
+      if (!isWatchPage()) {
+        if (el && el.parentNode) el.parentNode.removeChild(el);
+        return;
+      }
+      if (!el) {
+        el = document.createElement('style');
+        el.id = '__u2s_player_only';
+        el.textContent = PLAYER_ONLY_CSS;
+      }
+      // Keep it last in <head> so it always wins the cascade, and re-attach if
+      // YouTube's renderer removed it.
+      var head = document.head || document.documentElement;
+      if (el.parentNode !== head || head.lastChild !== el) {
+        head.appendChild(el);
+      }
+    }
+    ensurePlayerOnlyStyle();
     setInterval(function () {
+      ensurePlayerOnlyStyle();
       var btn = document.querySelector(
         '.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button'
       );
@@ -157,8 +201,14 @@ const AD_SKIP_JS = `
 function setupYouTubeCleanup(guest: Electron.WebContents, ch: Channel) {
   const apply = () => {
     const url = guest.getURL();
-    if (!/youtube\.com|youtu\.be/.test(url)) return;
-    guest.insertCSS(PLAYER_ONLY_CSS).catch((): void => {});
+    const isYouTube = /youtube\.com|youtu\.be/.test(url);
+    // Output black only on YouTube *browse* pages. Non-YouTube URLs (arbitrary
+    // video pages) are always captured; YouTube watch/shorts pages are captured.
+    ch.onWatchPage = !isYouTube || isWatchUrl(url);
+    if (!isYouTube) return;
+    // The persistent-<style> injector (AD_SKIP_JS) applies/removes the
+    // "video only" layout itself based on the live URL, so it self-heals across
+    // SPA navigations and never leaks onto browse pages. No eager insertCSS here.
     guest.executeJavaScript(AD_SKIP_JS).catch((): void => {});
     // The previous page's key is invalid after navigation; re-insert if enabled.
     ch.hideCssKey = null;
@@ -174,6 +224,7 @@ function setupYouTubeCleanup(guest: Electron.WebContents, ch: Channel) {
   guest.on('dom-ready', apply);
   // YouTube is a SPA; re-apply on in-page navigations too.
   guest.on('did-navigate-in-page', apply);
+  guest.on('did-navigate', apply);
 }
 
 const createWindow = () => {
@@ -199,6 +250,17 @@ const createWindow = () => {
 };
 
 // ---- Capture loop (per channel) -------------------------------------------
+
+// Shared opaque-black BGRA frame, published while the guest is on a YouTube
+// browse page (so receivers never see the search/home UI, only real video).
+let blackFrame: Uint8Array | null = null;
+function getBlackFrame(): Uint8Array {
+  if (!blackFrame) {
+    blackFrame = new Uint8Array(OUT_W * OUT_H * 4);
+    for (let i = 3; i < blackFrame.length; i += 4) blackFrame[i] = 255; // alpha
+  }
+  return blackFrame;
+}
 
 function makeRedFrame(): Uint8Array {
   // BGRA solid red (SyphonManager swizzles BGRA->RGBA).
@@ -253,6 +315,12 @@ async function captureTick(ch: Channel) {
     const guest = webContents.fromId(ch.guestContentsId);
     if (!guest || guest.isDestroyed()) {
       ch.guestContentsId = null;
+      return;
+    }
+
+    // Browsing YouTube (home/search/channel) — output black, not the page UI.
+    if (!ch.onWatchPage) {
+      if (ch.syphon.publishBGRA(getBlackFrame(), OUT_W, OUT_H)) countFrame(ch);
       return;
     }
 

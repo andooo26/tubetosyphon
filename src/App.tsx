@@ -141,6 +141,25 @@ function Player({
     if (text) setInput(text);
   };
 
+  // Open YouTube's home page inside the webview so the user can search + pick a
+  // video in-app. Browse pages keep the full YouTube UI; once a video's watch
+  // page opens, the main process auto-collapses it to "video only".
+  const browseYouTube = () => {
+    const url = 'https://www.youtube.com';
+    setLoadedUrl(url);
+    if (webviewRef.current) {
+      (webviewRef.current as unknown as { src: string }).src = url;
+    }
+  };
+
+  const goBack = () => {
+    const wv = webviewRef.current as unknown as {
+      canGoBack?: () => boolean;
+      goBack?: () => void;
+    } | null;
+    if (wv && wv.canGoBack?.()) wv.goBack?.();
+  };
+
   const toggleOutput = async () => {
     const res = status.running
       ? await window.api.stopOutput(channel)
@@ -175,6 +194,10 @@ function Player({
   return (
     <div className="player">
       <header className="bar">
+        <button onClick={goBack} disabled={!loadedUrl} title="Back">
+          ←
+        </button>
+        <button onClick={browseYouTube}>YouTube</button>
         <input
           className="url"
           placeholder="Paste a YouTube (or any) URL…"
@@ -224,7 +247,8 @@ function Player({
         />
         {!loadedUrl && (
           <div className="placeholder">
-            Paste a URL and press Play, then “Start Syphon”.
+            Press “YouTube” to browse &amp; pick a video, or paste a URL and
+            press Play. Then “Start Syphon”.
             <br />
             Outputs 1920×1080 as <b>{status.serverName}</b>.
           </div>
