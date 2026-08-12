@@ -7,7 +7,14 @@
  * the user sees is what Syphon receives.
  */
 
-export type Genre = 'techno' | 'house' | 'dnb' | 'hiphop' | 'ambient' | 'pop';
+export type Genre =
+  | 'techno'
+  | 'house'
+  | 'dnb'
+  | 'hiphop'
+  | 'ambient'
+  | 'pop'
+  | 'kawaii';
 
 export interface GenParams {
   bpm: number;
@@ -29,6 +36,7 @@ export const GENRES: { value: Genre; label: string; bpm: number }[] = [
   { value: 'hiphop', label: 'Hip-Hop', bpm: 90 },
   { value: 'ambient', label: 'Ambient', bpm: 70 },
   { value: 'pop', label: 'Pop / EDM', bpm: 128 },
+  { value: 'kawaii', label: 'Kawaii', bpm: 150 },
 ];
 
 export const MIN_BPM = 40;

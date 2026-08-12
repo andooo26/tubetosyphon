@@ -9,9 +9,22 @@
  * no per-pixel JS — so a 1920x1080 frame stays cheap enough for 60 fps.
  */
 
-import type { GenParams } from './params';
+import type { GenParams, Genre } from './params';
 
 const TAU = Math.PI * 2;
+
+// How hard the closing vignette bites, per preset. The dark presets want the
+// full amount; the bright ones (kawaii) would turn muddy, and Minimal is mostly
+// black already so a heavy vignette just eats its few marks.
+const VIGNETTE: Record<Genre, number> = {
+  techno: 0.55,
+  house: 0.55,
+  dnb: 0.55,
+  hiphop: 0.55,
+  ambient: 0.55,
+  pop: 0.55,
+  kawaii: 0.16,
+};
 
 /** Deterministic pseudo-random in [0,1) — same value for the same index. */
 function rnd(i: number): number {
@@ -95,6 +108,9 @@ export function drawGen(
     case 'pop':
       drawPop(ctx, w, h, c);
       break;
+    case 'kawaii':
+      drawKawaii(ctx, w, h, c);
+      break;
   }
 
   // Shared finish: a subtle vignette keeps the edges from clipping to flat white
@@ -108,7 +124,7 @@ export function drawGen(
     Math.max(w, h) * 0.72,
   );
   vig.addColorStop(0, 'rgba(0,0,0,0)');
-  vig.addColorStop(1, 'rgba(0,0,0,0.55)');
+  vig.addColorStop(1, `rgba(0,0,0,${VIGNETTE[p.genre] ?? 0.55})`);
   ctx.globalCompositeOperation = 'source-over';
   ctx.fillStyle = vig;
   ctx.fillRect(0, 0, w, h);
@@ -401,4 +417,154 @@ function drawPop(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) 
   }
   ctx.stroke();
   ctx.globalCompositeOperation = 'source-over';
+}
+
+// ---- Shape helpers (used by the presets below) -----------------------------
+
+/** Heart outline centred on (0,0), `s` tall, as a path on the current context. */
+function heartPath(ctx: CanvasRenderingContext2D, s: number) {
+  // Parametric heart sampled as a polyline — always closes cleanly, and 40
+  // segments is indistinguishable from curves at these sizes.
+  const k = s / 32;
+  ctx.beginPath();
+  for (let i = 0; i <= 40; i++) {
+    const t = (i / 40) * TAU;
+    const x = 16 * Math.pow(Math.sin(t), 3) * k;
+    const y =
+      -(13 * Math.cos(t) -
+        5 * Math.cos(2 * t) -
+        2 * Math.cos(3 * t) -
+        Math.cos(4 * t)) *
+      k;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+/** Four-pointed sparkle centred on (0,0), `s` across. */
+function sparklePath(ctx: CanvasRenderingContext2D, s: number) {
+  const r = s / 2;
+  const w = s * 0.14;
+  ctx.beginPath();
+  ctx.moveTo(0, -r);
+  ctx.quadraticCurveTo(w, -w, r, 0);
+  ctx.quadraticCurveTo(w, w, 0, r);
+  ctx.quadraticCurveTo(-w, w, -r, 0);
+  ctx.quadraticCurveTo(-w, -w, 0, -r);
+  ctx.closePath();
+}
+
+/** `points`-pointed star centred on (0,0), outer radius `R`. */
+function starPath(
+  ctx: CanvasRenderingContext2D,
+  R: number,
+  points = 5,
+  inner = 0.45,
+) {
+  ctx.beginPath();
+  for (let i = 0; i < points * 2; i++) {
+    const a = (i / (points * 2)) * TAU - Math.PI / 2;
+    const rr = i % 2 === 0 ? R : R * inner;
+    const x = Math.cos(a) * rr;
+    const y = Math.sin(a) * rr;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+// ---- Kawaii: pastel, hearts & sparkles, squash-and-stretch on the beat ------
+
+function drawKawaii(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) {
+  const pulse = c.env * c.I;
+  // Kawaii lives or dies on the palette, so the hue slider is *damped* here: it
+  // shifts the look across pink -> lavender -> peach instead of sweeping the
+  // whole wheel and landing on, say, olive.
+  const kh = 300 + (c.hue / 360) * 90;
+  // Pastel sky: pink at the top into mint at the bottom, brightening on the beat.
+  const bg = ctx.createLinearGradient(0, 0, 0, h);
+  bg.addColorStop(0, hsl(kh, 95, 84 + pulse * 5));
+  bg.addColorStop(0.55, hsl(kh + 30, 90, 88 + pulse * 4));
+  bg.addColorStop(1, hsl(kh + 210, 80, 86 + pulse * 4));
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, w, h);
+
+  // Big soft polka dots drifting upward, one row per 2 beats.
+  const cols = 7;
+  const dotR = w / cols / 3.4;
+  for (let gy = -1; gy < 6; gy++) {
+    for (let gx = 0; gx < cols; gx++) {
+      const stagger = gy % 2 ? 0.5 : 0;
+      const x = ((gx + stagger) / cols) * w + w / cols / 2;
+      const y = ((gy + 1 - ((c.beat * 0.5) % 1)) / 5) * (h * 1.2) - h * 0.1;
+      ctx.fillStyle = hsl(kh + 10 + ((gx + gy) % 3) * 40, 90, 92, 0.5);
+      ctx.beginPath();
+      ctx.arc(x, y, dotR, 0, TAU);
+      ctx.fill();
+    }
+  }
+
+  // A wavy ribbon across the middle.
+  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+  ctx.lineWidth = 10 + pulse * 8;
+  ctx.beginPath();
+  for (let x = 0; x <= w; x += 12) {
+    const y =
+      h * 0.5 +
+      Math.sin(x / (w / 3) + c.beat * 0.6) * h * 0.09 +
+      Math.sin(x / (w / 7) - c.beat * 0.4) * h * 0.03;
+    if (x === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Hearts and stars bouncing on the beat, with a squash-and-stretch wobble.
+  const items = 6 + Math.round(c.I * 6);
+  for (let i = 0; i < items; i++) {
+    const r1 = rnd(i * 3 + 1);
+    const r2 = rnd(i * 5 + 2);
+    // Each item bounces on its own beat offset so they don't all land together.
+    const off = r1;
+    const bph = (c.beat + off) % 1;
+    const bounce = Math.abs(Math.sin(bph * Math.PI));
+    const x = (r1 * 0.86 + 0.07) * w + Math.sin(c.beat * 0.4 + i) * w * 0.02;
+    const y = (r2 * 0.7 + 0.12) * h - bounce * h * 0.06;
+    const s = (0.06 + r2 * 0.06) * Math.min(w, h) * (1 + c.I * 0.4);
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(Math.sin(c.beat * 0.5 + i) * 0.25);
+    // Squash on landing, stretch at the top of the bounce.
+    ctx.scale(1 + (1 - bounce) * 0.14, 1 - (1 - bounce) * 0.14);
+    const hu = kh + r1 * 70;
+    ctx.fillStyle = hsl(hu, 95, 72);
+    ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+    ctx.lineWidth = 5;
+    if (i % 3 === 0) starPath(ctx, s * 0.55);
+    else heartPath(ctx, s);
+    ctx.fill();
+    ctx.stroke();
+    // Highlight blob — the "つやつや" dot.
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.beginPath();
+    ctx.ellipse(-s * 0.16, -s * 0.16, s * 0.09, s * 0.06, -0.6, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Twinkling sparkles on the 8ths.
+  const tw = 18 + Math.round(c.I * 26);
+  for (let i = 0; i < tw; i++) {
+    const ph = (c.beat * 2 + rnd(i + 41)) % 1;
+    const a = Math.pow(1 - ph, 2);
+    if (a < 0.05) continue;
+    const s = (6 + rnd(i + 13) * 26) * (0.5 + a);
+    ctx.save();
+    ctx.translate(rnd(i + 7) * w, rnd(i + 29) * h);
+    ctx.rotate(rnd(i + 3) * TAU);
+    ctx.fillStyle = `rgba(255,255,255,${a * 0.9})`;
+    sparklePath(ctx, s);
+    ctx.fill();
+    ctx.restore();
+  }
 }
