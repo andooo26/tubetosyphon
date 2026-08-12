@@ -302,14 +302,14 @@ function Player({
             className={status.running ? 'danger' : 'primary'}
             onClick={toggleOutput}
           >
-            {status.running ? 'Stop Syphon' : 'Start Syphon'}
+            {status.running ? 'Stop output' : 'Start output'}
           </button>
         )}
         <button onClick={toggleHideControls}>
-          {status.hideControls ? 'Controls: hidden' : 'Controls: shown'}
+          {status.hideControls ? 'Chrome: off' : 'Chrome: on'}
         </button>
         <label className="quality" title="YouTube playback quality">
-          Quality:
+          Quality
           <select
             value={status.quality}
             onChange={(e) => changeQuality(e.target.value as Quality)}
@@ -324,7 +324,7 @@ function Player({
         <div className="spacer" />
         <div className="statusline">
           {vjMode ? (
-            <b>{channel === 'left' ? 'A' : 'B'}</b>
+            <b className="chanid">{channel === 'left' ? 'A' : 'B'}</b>
           ) : (
             <>
               <span className={`dot ${status.running ? 'on' : 'off'}`} />
@@ -356,10 +356,9 @@ function Player({
         />
         {!loadedUrl && (
           <div className="placeholder">
-            Press “YouTube” to browse &amp; pick a video, or paste a URL and
-            press Play. Then “Start Syphon”.
-            <br />
-            Outputs 1920×1080 as <b>{status.serverName}</b>.
+            <span>No source · {channel === 'left' ? 'A' : 'B'}</span>
+            <span>Search, paste a URL, or browse YouTube</span>
+            <span>1920×1080 → {status.serverName}</span>
           </div>
         )}
       </div>
@@ -441,31 +440,43 @@ function VjBar({ status }: { status: AppStatus }) {
   return (
     <div className="vjbar">
       <div className="modes">
-        <button
-          className={status.mode === 'dual' ? 'primary' : ''}
-          onClick={() => setMode('dual')}
-        >
-          Dual (2 out)
-        </button>
-        <button
-          className={vjMode ? 'primary' : ''}
-          onClick={() => setMode('vj')}
-        >
-          VJ (1 out)
-        </button>
-        <button
-          className={status.mode === 'gen' ? 'primary' : ''}
-          onClick={() => setMode('gen')}
-          title="BPM/ジャンル駆動の汎用グラフィックスを出力"
-        >
-          汎用 (Generative)
-        </button>
+        <span className="wordmark">Tube to Syphon</span>
+        <div className="segmented">
+          <button
+            className={status.mode === 'dual' ? 'primary' : ''}
+            onClick={() => setMode('dual')}
+            title="2つのプレイヤーを2系統のSyphonへ"
+          >
+            Dual
+          </button>
+          <button
+            className={vjMode ? 'primary' : ''}
+            onClick={() => setMode('vj')}
+            title="2つのプレイヤーをクロスフェードして1系統へ"
+          >
+            VJ
+          </button>
+          <button
+            className={status.mode === 'gen' ? 'primary' : ''}
+            onClick={() => setMode('gen')}
+            title="BPM/ジャンル駆動の汎用グラフィックスを出力"
+          >
+            Generative
+          </button>
+        </div>
+        <span className="wordmark">
+          {status.mode === 'dual'
+            ? '2 outputs'
+            : status.mode === 'vj'
+              ? '1 output · crossfade'
+              : '1 output · 汎用'}
+        </span>
       </div>
 
       {vjMode && (
         <div className="vjfade">
           <button onClick={() => fadeTo(0)} title="Fade to A over ~1s">
-            Fade A
+            Fade→A
           </button>
           <span className="ab">A</span>
           <input
@@ -479,7 +490,7 @@ function VjBar({ status }: { status: AppStatus }) {
           />
           <span className="ab">B</span>
           <button onClick={() => fadeTo(1)} title="Fade to B over ~1s">
-            Fade B
+            Fade→B
           </button>
           <div className="statusline">
             <span className={`dot ${vj.running ? 'on' : 'off'}`} />
@@ -537,9 +548,10 @@ function GenPanel({ status }: { status: AppStatus }) {
   return (
     <div className="genpanel">
       <div className="gencontrols">
+        <div className="genhead">Clock</div>
         <div className="genrow">
           <label className="quality">
-            Genre:
+            Genre
             <select
               value={p.genre}
               onChange={(e) => changeGenre(e.target.value as Genre)}
@@ -552,7 +564,7 @@ function GenPanel({ status }: { status: AppStatus }) {
             </select>
           </label>
           <label className="quality">
-            BPM:
+            BPM
             <input
               className="bpm"
               type="number"
@@ -574,6 +586,7 @@ function GenPanel({ status }: { status: AppStatus }) {
           </button>
         </div>
 
+        <div className="genhead">Look</div>
         <div className="genrow">
           <label className="quality slider">
             Intensity
@@ -586,10 +599,11 @@ function GenPanel({ status }: { status: AppStatus }) {
               onChange={(e) => patch({ intensity: Number(e.target.value) })}
             />
           </label>
+          {/* Rotates the preset's spot inks within a safe range rather than
+              sweeping the whole hue wheel, so a palette bends but never breaks. */}
           <label className="quality slider">
-            Hue
+            Tint
             <input
-              className="hue"
               type="range"
               min={0}
               max={359}
@@ -611,8 +625,10 @@ function GenPanel({ status }: { status: AppStatus }) {
       </div>
 
       <div className="genpreview">
-        <GenCanvas params={p} width={640} height={360} className="genthumb" />
-        <div className="genhint">Preview (live) — output goes to Syphon</div>
+        {/* 720p backing store: the preview is displayed large, and at 640×360 the
+            type and hairlines in the sketch visibly softened when scaled up. */}
+        <GenCanvas params={p} width={1280} height={720} className="genthumb" />
+        <div className="genhint">Live preview · identical to the Syphon output</div>
       </div>
     </div>
   );
