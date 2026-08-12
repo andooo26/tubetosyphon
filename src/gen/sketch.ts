@@ -5,27 +5,25 @@
  * GenParams, draw one full frame. No internal state, so the offscreen output
  * window and the small UI preview stay in phase simply by sharing `beatEpoch`.
  *
- * Art direction — every preset is built like a screen-printed club flyer:
- * a fixed 2–4 ink palette on a stock (see palette.ts), flat shapes, halftone
- * and line screens instead of gradients, deliberate misregistration, cropped
- * condensed type, and asymmetric composition with real negative space.
- * Explicitly avoided: neon glow, additive "lighter" blooms, rainbow hue
- * sweeps, centred radial symmetry and vignettes — the house style of every
- * generative demo, which is exactly why it reads as generic.
+ * Art direction — screen-printed club graphics in motion: a fixed 2–4 ink
+ * palette on a stock (palette.ts), flat shapes, halftone and line screens
+ * instead of gradients, deliberate misregistration, asymmetric composition.
+ *
+ * No type, no readouts. These frames go to a projector, so burning the tempo or
+ * a bar counter into the image is a HUD, not a visual — the beat has to be
+ * legible from the movement itself.
+ *
+ * Motion rules (this is what separates it from a screensaver):
+ *   - Everything is cut or eased against the beat grid; nothing drifts freely.
+ *   - Hits use easeOutExpo (fast attack, long settle), never linear.
+ *   - Elements are staggered by index so a bar reads as a sequence, not a pulse.
+ *   - Each preset has one element on the beat, one on the bar, and one slow
+ *     phrase-length move, so there is always motion at three time scales.
  */
 
 import type { GenParams } from './params';
 import { PALETTES, ink, paperColor, tintShift, type Palette } from './palette';
-import {
-  condensed,
-  grain,
-  halftone,
-  label,
-  lineScreen,
-  misregister,
-  pad2,
-  regMark,
-} from './print';
+import { grain, halftone, lineScreen, misregister } from './print';
 
 const TAU = Math.PI * 2;
 
@@ -38,6 +36,17 @@ function rnd(i: number): number {
 /** Smooth 0..1 triangle-ish wave over `period` beats. */
 function wave(beat: number, period: number): number {
   return 0.5 - 0.5 * Math.cos((beat / period) * TAU);
+}
+
+// Easing. A hit that decays with easeOutExpo reads as struck; the same hit on a
+// linear ramp reads as a slider being dragged.
+const easeOutExpo = (t: number) => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t));
+const easeInOutCubic = (t: number) =>
+  t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+/** 0..1 progress of `beat` through a `len`-beat cycle, offset by `delay` beats. */
+function stagger(beat: number, len: number, delay: number): number {
+  return Math.min(1, Math.max(0, ((beat % len) - delay) / (len - delay || 1)));
 }
 
 interface Clock {
@@ -53,8 +62,6 @@ interface Clock {
   bar: number;
   /** 0..1 intensity. */
   I: number;
-  /** Tempo, for presets that set it as type. */
-  bpm: number;
   /** This preset's palette, and the tint rotation applied to its spot inks. */
   pal: Palette;
   shift: number;
@@ -89,7 +96,6 @@ export function drawGen(
     env: Math.pow(1 - phase, 3),
     bar: Math.pow(1 - barPhase, 5),
     I: p.intensity,
-    bpm,
     pal,
     shift: tintShift(p.hue),
   };
@@ -130,89 +136,93 @@ export function drawGen(
   ctx.restore();
 }
 
-// ---- Techno: step-sequencer grid, Swiss left column, hard downbeat ---------
+// ---- Techno: matrix sweep with a decaying trail, red slab on the downbeat ---
 
 function drawTechno(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) {
-  const m = w * 0.06; // margin
-  const step = Math.floor(c.beat * 4) % 16;
-  const bar = Math.floor(c.beat / 4) % 4;
-
-  // Type column, left-aligned, hanging off the top margin.
-  label(ctx, 'techno', m, h * 0.16, w * 0.013, c1(c, 1, 0.9));
-  ctx.fillStyle = c1(c, 0);
-  condensed(ctx, w * 0.115);
-  ctx.textBaseline = 'alphabetic';
-  ctx.fillText(String(Math.round(c.bpm)), m - w * 0.004, h * 0.3);
-  condensed(ctx, w * 0.02);
-  ctx.fillStyle = c1(c, 1, 0.55);
-  ctx.fillText(`BPM · BAR ${pad2(bar + 1)}/04 · STEP ${pad2(step + 1)}`, m, h * 0.35);
-
-  // Rule under the type block, drawn to the bleed.
-  ctx.fillStyle = c1(c, 1, 0.25);
-  ctx.fillRect(m, h * 0.4, w - m * 2, Math.max(1, h * 0.0018));
-
-  // 16 x 4 step grid. The playhead column is solid; everything else is a hairline
-  // cell, so the frame is mostly empty and the moving part carries it.
-  const gx = m;
-  const gy = h * 0.48;
-  const gw = w - m * 2;
-  const gh = h * 0.34;
   const cols = 16;
-  const rows = 4;
-  const cw = gw / cols;
-  const chh = gh / rows;
-  const pad = cw * 0.12;
+  const rows = 8;
+  const cw = w / cols;
+  const ch = h / rows;
+  const pad = cw * 0.14;
+  const step = Math.floor(c.beat * 4);
+  const sub = c.beat * 4 - step;
+
+  // Playhead sweeps one column per 16th. Columns behind it decay over four
+  // steps, so the movement leaves a trail instead of a single blinking line.
   for (let x = 0; x < cols; x++) {
+    // How many steps ago this column was hit (wrapping).
+    const age = (((step - x) % cols) + cols) % cols;
+    const trail = age === 0 ? 1 - sub * 0.15 : Math.max(0, 1 - age / 4);
     for (let y = 0; y < rows; y++) {
-      const on = x === step;
-      // A fixed but irregular pattern of "programmed" steps, re-rolled per bar.
-      const prog = rnd(x * 7 + y * 31 + bar * 13) < 0.18 + c.I * 0.22;
-      const rx = gx + x * cw + pad;
-      const ry = gy + y * chh + pad;
+      // Fixed programme per column: which rows light up when it is hit.
+      const on = rnd(x * 13 + y * 71) < 0.3 + c.I * 0.3;
+      const rx = x * cw + pad;
+      const ry = y * ch + pad;
       const rw = cw - pad * 2;
-      const rh = chh - pad * 2;
-      if (on) {
-        ctx.fillStyle = c1(c, 0);
-        ctx.fillRect(rx, ry, rw, rh);
-      } else if (prog) {
-        ctx.fillStyle = c1(c, 0, 0.32);
+      const rh = ch - pad * 2;
+      if (on && trail > 0.02) {
+        ctx.fillStyle = c1(c, 0, 0.15 + trail * 0.85);
         ctx.fillRect(rx, ry, rw, rh);
       } else {
-        ctx.strokeStyle = c1(c, 1, 0.16);
-        ctx.lineWidth = Math.max(1, w * 0.0012);
+        ctx.strokeStyle = c1(c, 1, 0.08);
+        ctx.lineWidth = Math.max(1, w * 0.001);
         ctx.strokeRect(rx, ry, rw, rh);
       }
     }
   }
 
-  // Downbeat: a solid red bar slams in from the right edge, one beat long.
-  if (c.bar > 0.25) {
-    const k = (c.bar - 0.25) / 0.75;
-    ctx.fillStyle = c1(c, 2);
-    ctx.fillRect(w - gw * k - m, h * 0.86, gw * k, h * 0.045);
+  // Every beat one row lights up whole, cell by cell, then drops out — a row
+  // inversion in the sequencer's own vocabulary. (A continuous bar sweeping the
+  // width just looked like a progress meter.)
+  const rowIdx = Math.floor(c.beat) % rows;
+  const reveal = easeOutExpo(Math.min(1, c.phase * 4)); // fills left to right
+  const fade = Math.max(0, 1 - Math.max(0, c.phase - 0.35) / 0.4);
+  if (fade > 0.02) {
+    for (let x = 0; x < cols; x++) {
+      if (x / cols > reveal) break;
+      ctx.fillStyle = c1(c, 1, 0.85 * fade);
+      ctx.fillRect(x * cw + pad, rowIdx * ch + pad, cw - pad * 2, ch - pad * 2);
+    }
   }
 
-  label(ctx, 'tube to syphon', m, h * 0.94, w * 0.0095, c1(c, 1, 0.35));
+  // Downbeat: a red slab wipes in from the right and retracts over the bar.
+  const wipe = 1 - easeOutExpo(Math.min(1, (1 - Math.pow(c.bar, 0.2)) * 1.4));
+  if (wipe > 0.01) {
+    ctx.fillStyle = c1(c, 2);
+    ctx.fillRect(w * (1 - wipe), h * 0.5 - ch * 0.5, w * wipe, ch);
+  }
+
+  // Phrase-length move: a hairline frame that steps outward every 8 beats.
+  const k = stagger(c.beat, 8, 0);
+  const inset = (0.02 + easeInOutCubic(k) * 0.05) * w;
+  ctx.strokeStyle = c1(c, 0, 0.35);
+  ctx.lineWidth = Math.max(1, w * 0.0015);
+  ctx.strokeRect(inset, inset * (h / w) * 1.2, w - inset * 2, h - inset * (h / w) * 2.4);
 }
 
-// ---- House: overlapping halftone discs, warm inks, slow drift --------------
+// ---- House: orbiting halftone discs, bar wipe, phrase-length swell ---------
 
 function drawHouse(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) {
   const swell = wave(c.beat, 16);
-  // Three discs, weighted to the lower left, sizes deliberately unequal.
   const discs: [number, number, number, number][] = [
-    [0.36, 0.58, 0.30, 0],
-    [0.55, 0.46, 0.22, 1],
-    [0.46, 0.68, 0.14, 2],
+    [0.34, 0.56, 0.31, 0],
+    [0.57, 0.44, 0.23, 1],
+    [0.47, 0.7, 0.15, 2],
   ];
   const rulings = [26, 16, 10];
 
   for (let i = 0; i < discs.length; i++) {
     const [fx, fy, fr, inkIdx] = discs[i];
-    const drift = 0.012 * Math.sin(c.beat * 0.08 + i * 2.1);
-    const x = w * (fx + drift);
-    const y = h * (fy - drift * 0.6);
-    const r = Math.min(w, h) * fr * (1 + swell * 0.05 + c.env * 0.012 * c.I);
+    // Each disc orbits its own small circle, staggered a beat apart, so the
+    // group is never in phase with itself.
+    const a = c.beat * 0.16 + (i * TAU) / 3;
+    const orbit = 0.035 + i * 0.012;
+    const x = w * (fx + Math.cos(a) * orbit);
+    const y = h * (fy + Math.sin(a) * orbit * 1.4);
+    // Beat pop, staggered by index: disc 0 on the beat, 1 an eighth later, etc.
+    const pop = easeOutExpo(Math.min(1, Math.max(0, (c.phase - i * 0.12) * 6)));
+    const r =
+      Math.min(w, h) * fr * (1 + swell * 0.05 + (1 - pop) * 0.05 * c.I);
     ctx.save();
     ctx.beginPath();
     ctx.arc(x, y, r, 0, TAU);
@@ -221,21 +231,19 @@ function drawHouse(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock
       ctx,
       ink(c.pal, inkIdx, c.shift),
       rulings[i],
-      // Capped: past ~0.5 the dots touch and the screen turns into a
-      // checkerboard instead of reading as a tint.
       Math.min(0.5, 0.2 + c.I * 0.3 + swell * 0.1),
     );
     if (pat) {
       ctx.save();
-      // Rotate the screen angle per ink, like separate plates.
       ctx.translate(x, y);
-      ctx.rotate(i * 0.35 + c.beat * 0.004);
+      // Each plate's screen turns at its own rate — the moiré between them is
+      // the slow-burning part of the motion.
+      ctx.rotate(i * 0.35 + c.beat * (0.01 + i * 0.006));
       ctx.fillStyle = pat;
       ctx.fillRect(-r * 1.6, -r * 1.6, r * 3.2, r * 3.2);
       ctx.restore();
     }
     ctx.restore();
-    // Thin containing rule so the disc reads as a drawn shape, not a blur.
     ctx.strokeStyle = ink(c.pal, inkIdx, c.shift, 0.7);
     ctx.lineWidth = Math.max(1, w * 0.0016);
     ctx.beginPath();
@@ -243,124 +251,142 @@ function drawHouse(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock
     ctx.stroke();
   }
 
-  // Horizon rule + type, upper right, against all that mass in the lower left.
-  const m = w * 0.06;
-  ctx.fillStyle = ink(c.pal, 2, c.shift, 0.5);
-  ctx.fillRect(m, h * 0.3, w - m * 2, Math.max(1, h * 0.0016));
-  ctx.textAlign = 'right';
-  label(ctx, 'house', w - m, h * 0.24, w * 0.013, ink(c.pal, 2, c.shift, 0.9));
-  condensed(ctx, w * 0.05);
-  ctx.fillStyle = ink(c.pal, 0, c.shift);
-  ctx.fillText(`${Math.round(c.bpm)}`, w - m, h * 0.215);
-  ctx.textAlign = 'left';
+  // A solid bar sweeps the full width once per 4 bars, cutting across everything.
+  const sweep = easeInOutCubic(stagger(c.beat, 16, 12));
+  if (sweep > 0 && sweep < 1) {
+    ctx.fillStyle = ink(c.pal, 2, c.shift, 0.85);
+    ctx.fillRect(w * sweep - w * 0.02, 0, w * 0.02, h);
+  }
+
+  // Horizon rule, riding the swell.
+  ctx.fillStyle = ink(c.pal, 2, c.shift, 0.35);
+  ctx.fillRect(0, h * (0.3 + swell * 0.02), w, Math.max(1, h * 0.0016));
 }
 
-// ---- Drum & Bass: sliced condensed type, CMY misregistration ---------------
+// ---- Drum & Bass: sliced slabs, CMY misregistration, 16th-note jumps -------
 
 function drawDnb(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) {
   const step = Math.floor(c.beat * 4);
   const sub = Math.pow(1 - (c.beat * 4 - step), 3);
-  const word = String(Math.round(c.bpm));
 
-  // One huge numeral, cropped by the frame, sliced into bands that jump on 16ths.
-  condensed(ctx, h * 0.78);
-  ctx.textBaseline = 'middle';
-  const tw = ctx.measureText(word).width;
-  const bx = w * 0.5 - tw / 2 + w * 0.04; // pushed off-centre
-  const by = h * 0.52;
+  // One heavy mark — a disc, a column and a wedge locked together — rather than
+  // a stack of bars. The slicing below only reads as torn if the shape it cuts
+  // through has vertical edges to displace.
+  const spin = easeInOutCubic(stagger(c.beat, 4, 2)) * (Math.PI / 6);
+  const paint = (g: CanvasRenderingContext2D) => {
+    g.save();
+    g.translate(w * 0.5, h * 0.5);
+    g.rotate(-0.18 + spin);
+    const R = Math.min(w, h) * 0.34;
+    g.beginPath();
+    g.arc(-R * 0.35, 0, R, 0, TAU);
+    g.fill();
+    g.fillRect(-R * 0.2, -R * 1.25, R * 0.55, R * 2.5); // column
+    g.beginPath(); // wedge
+    g.moveTo(R * 0.5, -R * 1.1);
+    g.lineTo(R * 1.7, 0);
+    g.lineTo(R * 0.5, R * 1.1);
+    g.closePath();
+    g.fill();
+    g.restore();
+  };
+
   const bands = 9;
   for (let i = 0; i < bands; i++) {
-    const y0 = (i / bands) * h;
-    const bh = h / bands + 1;
-    const jump = (rnd(step * 17 + i * 5) - 0.5) * w * 0.09 * (0.35 + c.I);
+    const jump = (rnd(step * 17 + i * 5) - 0.5) * w * 0.1 * (0.35 + c.I);
     ctx.save();
     ctx.beginPath();
-    ctx.rect(0, y0, w, bh);
+    ctx.rect(0, (i / bands) * h, w, h / bands + 1);
     ctx.clip();
+    ctx.translate(jump, 0);
     misregister(
       ctx,
-      w * 0.004 + sub * w * 0.006,
+      w * 0.004 + sub * w * 0.008,
       0,
       ink(c.pal, 0, c.shift),
       ink(c.pal, 1, c.shift),
-      (g) => {
-        condensed(g, h * 0.78);
-        g.textBaseline = 'middle';
-        g.fillText(word, bx + jump, by);
-      },
+      paint,
     );
     ctx.restore();
   }
 
-  // Hairline rules between the bands — makes the slicing look specified.
-  ctx.fillStyle = ink(c.pal, 2, c.shift, 0.22);
+  // Hairlines between the bands — makes the tearing look specified rather than
+  // accidental.
+  ctx.fillStyle = ink(c.pal, 2, c.shift, 0.18);
   for (let i = 1; i < bands; i++) {
     ctx.fillRect(0, (i / bands) * h, w, 1);
   }
 
-  const m = w * 0.05;
-  ctx.textBaseline = 'alphabetic';
-  label(ctx, `drum & bass · ${pad2((step % 16) + 1)}/16`, m, h * 0.09, w * 0.011,
-    ink(c.pal, 2, c.shift, 0.8));
-  regMark(ctx, w - m, h * 0.09, w * 0.014, ink(c.pal, 2, c.shift, 0.7));
-  regMark(ctx, m * 0.7, h * 0.93, w * 0.014, ink(c.pal, 2, c.shift, 0.5));
+  // A hard vertical shutter that jumps to a new column every 8th note.
+  const shutter = rnd(Math.floor(c.beat * 2) * 3 + 7);
+  ctx.fillStyle = ink(c.pal, 2, c.shift, 0.9 * sub);
+  ctx.fillRect(w * shutter, 0, Math.max(2, w * 0.004), h);
+
+  // Phrase move: the whole frame is squeezed by two shutters closing every 8 beats.
+  const close = easeInOutCubic(stagger(c.beat, 8, 6)) * 0.06 * w;
+  ctx.fillStyle = paperColor(c.pal, c.shift);
+  ctx.fillRect(0, 0, close, h);
+  ctx.fillRect(w - close, 0, close, h);
 }
 
-// ---- Hip-Hop: cream poster stock, black type, one red block ----------------
+// ---- Hip-Hop: cream stock, heavy shapes snapping on the half beat ----------
 
 function drawHipHop(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) {
-  // The half-beat "boom bap" jogs the whole composition a few px, like a press
-  // slipping — motion without any easing curve.
+  // The half-beat jogs the whole composition, like a press slipping.
   const hit = Math.pow(1 - ((c.beat * 2) % 1), 5);
-  const jog = hit * w * 0.006;
   ctx.save();
-  ctx.translate(jog, -jog * 0.5);
+  ctx.translate(hit * w * 0.006, -hit * w * 0.003);
 
-  const m = w * 0.06;
   const bar = Math.floor(c.beat / 4) % 4;
+  const beatIdx = Math.floor(c.beat) % 4;
 
-  // Red block, snapping to one of four positions on the bar.
-  const slots = [0.08, 0.34, 0.52, 0.2];
+  // Red block slides between four positions, one per beat, easing out hard.
+  const slots = [0.1, 0.36, 0.2, 0.5];
+  const from = slots[(beatIdx + 3) % 4];
+  const to = slots[beatIdx];
+  const slide = from + (to - from) * easeOutExpo(Math.min(1, c.phase * 2.2));
   ctx.fillStyle = c1(c, 1);
-  ctx.fillRect(w * 0.52, h * slots[bar], w * 0.42, h * (0.26 + c.I * 0.12));
+  ctx.fillRect(w * 0.5, h * slide, w * 0.44, h * (0.24 + c.I * 0.1));
 
-  // Halftone disc, overlapping the block, bleeding off the right edge.
-  const dx = w * 0.86;
-  const dy = h * 0.62;
-  const dr = Math.min(w, h) * 0.3;
-  ctx.save();
+  // Black disc, bleeding off the right edge, scaling in steps once per bar.
+  const dr = Math.min(w, h) * (0.26 + bar * 0.02);
+  const dx = w * 0.84;
+  const dy = h * 0.6;
+  ctx.fillStyle = c1(c, 0);
   ctx.beginPath();
   ctx.arc(dx, dy, dr, 0, TAU);
+  ctx.fill();
+
+  // Halftone disc knocked over it, offset the other way.
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(dx - dr * 0.5, dy - dr * 0.3, dr * 0.8, 0, TAU);
   ctx.clip();
   const pat = halftone(ctx, c1(c, 0), 14, Math.min(0.48, 0.22 + c.I * 0.3));
   if (pat) {
+    ctx.fillStyle = paperColor(c.pal, c.shift);
+    ctx.fillRect(dx - dr * 1.4, dy - dr * 1.2, dr * 2, dr * 2);
     ctx.fillStyle = pat;
-    ctx.fillRect(dx - dr, dy - dr, dr * 2, dr * 2);
+    ctx.fillRect(dx - dr * 1.4, dy - dr * 1.2, dr * 2, dr * 2);
   }
   ctx.restore();
 
-  // Giant bar numeral, cropped hard by the left edge.
+  // Heavy left bar, growing across the bar then cutting back — the composition's
+  // metronome.
+  const grow = easeOutExpo(stagger(c.beat, 4, 0));
   ctx.fillStyle = c1(c, 0);
-  condensed(ctx, h * 0.72);
-  ctx.textBaseline = 'middle';
-  ctx.fillText(pad2(bar + 1), -w * 0.02, h * 0.55);
+  ctx.fillRect(0, h * 0.12, w * (0.06 + grow * 0.3), h * 0.1);
 
-  // Annotation stack, bottom left.
-  ctx.textBaseline = 'alphabetic';
-  label(ctx, 'hip-hop', m, h * 0.14, w * 0.013, c1(c, 0, 0.9));
-  ctx.fillStyle = c1(c, 0, 0.6);
-  condensed(ctx, w * 0.018);
-  ctx.fillText(`${Math.round(c.bpm)} BPM`, m, h * 0.175);
-  ctx.fillStyle = c1(c, 0, 0.85);
-  ctx.fillRect(m, h * 0.19, w * 0.12, Math.max(1, h * 0.004));
+  // Slow move: a thin rule crossing the frame over 8 beats.
+  const cross = easeInOutCubic(stagger(c.beat, 8, 0));
+  ctx.fillStyle = c1(c, 0, 0.8);
+  ctx.fillRect(0, h * (0.05 + cross * 0.9), w, Math.max(1, h * 0.003));
   ctx.restore();
 }
 
-// ---- Ambient: breathing line screen, one soft disc, near monochrome --------
+// ---- Ambient: breathing line screen, discs knocked out of the field --------
 
 function drawAmbient(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) {
-  // Line spacing breathes over a 16-beat phrase; two overlaid screens at slightly
-  // different rulings give a slow moiré that never repeats on the eye.
   const breathe = wave(c.beat, 16);
   const rulings = [
     9 + Math.round(breathe * 5),
@@ -381,43 +407,67 @@ function drawAmbient(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clo
     ctx.restore();
   }
 
-  // A single disc knocked out of the field, drifting off-centre.
-  const x = w * (0.62 + 0.03 * Math.sin(c.beat * 0.03));
-  const y = h * (0.44 + 0.03 * Math.cos(c.beat * 0.023));
-  const r = Math.min(w, h) * (0.24 + breathe * 0.03);
-  // Knocked out to the stock, not to black — a hole in the ink, not a void.
-  ctx.fillStyle = paperColor(c.pal, c.shift);
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, TAU);
-  ctx.fill();
-  ctx.strokeStyle = ink(c.pal, 0, c.shift, 0.45);
-  ctx.lineWidth = Math.max(1, w * 0.0012);
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, TAU);
-  ctx.stroke();
+  // Two discs knocked out of the field, drifting on very long cycles — the only
+  // preset with no beat-rate event, which is the point.
+  const discs: [number, number, number, number][] = [
+    [0.62, 0.44, 0.24, 0.03],
+    [0.26, 0.62, 0.1, -0.017],
+  ];
+  for (let i = 0; i < discs.length; i++) {
+    const [fx, fy, fr, sp] = discs[i];
+    const x = w * (fx + 0.03 * Math.sin(c.beat * sp));
+    const y = h * (fy + 0.03 * Math.cos(c.beat * sp * 0.77));
+    const r = Math.min(w, h) * (fr + breathe * 0.03);
+    ctx.fillStyle = paperColor(c.pal, c.shift);
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, TAU);
+    ctx.fill();
+    ctx.strokeStyle = ink(c.pal, 0, c.shift, 0.4);
+    ctx.lineWidth = Math.max(1, w * 0.0012);
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, TAU);
+    ctx.stroke();
+  }
 
-  const m = w * 0.06;
-  label(ctx, 'ambient', m, h * 0.9, w * 0.011, ink(c.pal, 0, c.shift, 0.55));
+  // A band of field re-appears inside the big disc once per 32 beats, sweeping
+  // through it — the whole piece's single event.
+  const sweep = stagger(c.beat, 32, 24);
+  if (sweep > 0 && sweep < 1) {
+    const x = w * (0.62 - 0.24) + easeInOutCubic(sweep) * w * 0.48;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(w * 0.62, h * 0.44, Math.min(w, h) * 0.24, 0, TAU);
+    ctx.clip();
+    const pat = lineScreen(ctx, ink(c.pal, 1, c.shift, 0.6), rulings[0], 1);
+    if (pat) {
+      ctx.fillStyle = pat;
+      ctx.fillRect(x - w * 0.06, 0, w * 0.12, h);
+    }
+    ctx.restore();
+  }
 }
 
-// ---- Pop: flat pop-art shapes with an offset second ink --------------------
+// ---- Pop: flat shapes trading places, printed out of register --------------
 
 function drawPop(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) {
   const m = w * 0.07;
-  const swap = Math.floor(c.beat) % 2 === 0;
   const off = w * 0.012 + c.env * w * 0.006 * c.I;
+  const beatIdx = Math.floor(c.beat) % 2;
+  // The swap eases across the first third of the beat, then holds — a cut with
+  // a bit of travel, rather than a constant slide.
+  const k = easeInOutCubic(Math.min(1, c.phase * 3));
+  const t = beatIdx === 0 ? k : 1 - k;
 
-  // Halftone field across the lower band.
   const pat = halftone(ctx, c1(c, 0, 0.8), 20, 0.18 + c.I * 0.3);
   if (pat) {
     ctx.fillStyle = pat;
     ctx.fillRect(0, h * 0.62, w, h * 0.38);
   }
 
-  // A disc and a square trading places every beat, each printed twice out of
-  // register so the shapes have an edge instead of a glow.
-  const a = { x: w * (swap ? 0.36 : 0.66), y: h * 0.44, r: Math.min(w, h) * 0.21 };
-  const b = { x: w * (swap ? 0.68 : 0.34), y: h * 0.5, s: Math.min(w, h) * 0.3 };
+  const ax = w * (0.66 - 0.3 * t);
+  const bx = w * (0.34 + 0.34 * t);
+  const ar = Math.min(w, h) * (0.19 + c.env * 0.02 * c.I);
+  const bs = Math.min(w, h) * 0.3;
 
   misregister(
     ctx,
@@ -427,7 +477,7 @@ function drawPop(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) 
     c1(c, 0),
     (g) => {
       g.beginPath();
-      g.arc(a.x, a.y, a.r, 0, TAU);
+      g.arc(ax, h * 0.44, ar, 0, TAU);
       g.fill();
     },
     'multiply',
@@ -439,31 +489,33 @@ function drawPop(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) 
     c1(c, 0),
     c1(c, 1),
     (g) => {
-      g.fillRect(b.x - b.s / 2, b.y - b.s / 2, b.s, b.s);
+      g.save();
+      g.translate(bx, h * 0.5);
+      // The square counter-rotates a quarter turn per bar, so the two shapes are
+      // never doing the same thing.
+      g.rotate(easeInOutCubic(stagger(c.beat, 4, 2)) * (Math.PI / 2));
+      g.fillRect(-bs / 2, -bs / 2, bs, bs);
+      g.restore();
     },
     'multiply',
   );
 
-  // Frame rule + type, top left, hanging outside the shapes.
+  // Frame rule, stepping inward on the downbeat and easing back.
+  const pull = easeOutExpo(Math.min(1, (1 - c.bar) * 2)) * w * 0.012;
   ctx.strokeStyle = c1(c, 1, 0.9);
   ctx.lineWidth = Math.max(2, w * 0.003);
-  ctx.strokeRect(m * 0.5, m * 0.5, w - m, h - m);
-  label(ctx, 'pop', m, h * 0.15, w * 0.014, c1(c, 1));
-  ctx.fillStyle = c1(c, 1, 0.75);
-  condensed(ctx, w * 0.018);
-  ctx.fillText(`${Math.round(c.bpm)} BPM · ${pad2((Math.floor(c.beat) % 4) + 1)}/04`,
-    m, h * 0.19);
+  ctx.strokeRect(m * 0.5 + pull, m * 0.5 + pull, w - m - pull * 2, h - m - pull * 2);
 }
 
 // ---- Kawaii: Y2K sticker sheet — flat inks, hard black outlines ------------
 
 function drawKawaii(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) {
   const outline = c1(c, 2);
-  const m = w * 0.05;
 
-  // Checkerboard band across the lower third — flat, no gradient anywhere.
+  // Checkerboard band scrolls a cell every two beats, in steps rather than
+  // smoothly — it should feel switched, not slid.
   const cell = w / 16;
-  const scroll = (c.beat * cell * 0.5) % (cell * 2);
+  const scroll = Math.floor(c.beat * 2) * cell * 0.5;
   ctx.save();
   ctx.beginPath();
   ctx.rect(0, h * 0.66, w, h * 0.34);
@@ -472,46 +524,47 @@ function drawKawaii(ctx: CanvasRenderingContext2D, w: number, h: number, c: Cloc
     for (let y = 0; y < 6; y++) {
       if ((x + y) % 2) continue;
       ctx.fillStyle = c1(c, 1, 0.85);
-      ctx.fillRect(x * cell - scroll, h * 0.66 + y * cell, cell, cell);
+      ctx.fillRect(x * cell - (scroll % (cell * 2)), h * 0.66 + y * cell, cell, cell);
     }
   }
   ctx.restore();
   ctx.fillStyle = outline;
   ctx.fillRect(0, h * 0.66 - h * 0.008, w, h * 0.008);
 
-  // Halftone blush behind the stickers, upper left.
+  // Halftone blush, breathing over a bar.
+  const blush = Math.min(w, h) * (0.24 + wave(c.beat, 4) * 0.03);
   const pat = halftone(ctx, c1(c, 0, 0.9), 18, 0.3);
   if (pat) {
     ctx.save();
     ctx.beginPath();
-    ctx.arc(w * 0.26, h * 0.3, Math.min(w, h) * 0.26, 0, TAU);
+    ctx.arc(w * 0.24, h * 0.32, blush, 0, TAU);
     ctx.clip();
     ctx.fillStyle = pat;
     ctx.fillRect(0, 0, w, h);
     ctx.restore();
   }
 
-  // Stickers: flat fill, thick black outline, hard offset shadow. No highlights,
-  // no soft edges — die-cut vinyl, not an airbrush.
-  const items = 5 + Math.round(c.I * 2);
+  // Stickers on a jittered grid, each bouncing on its own beat offset and
+  // squashing on landing.
+  const items = 6 + Math.round(c.I * 2);
   for (let i = 0; i < items; i++) {
     const r1 = rnd(i * 3 + 1);
     const r2 = rnd(i * 5 + 2);
-    const bounce = Math.abs(Math.sin(((c.beat + r1) % 1) * Math.PI));
-    // Jittered grid rather than pure random placement: keeps the sheet evenly
-    // covered without the clumps and holes a random scatter always produces.
-    // Cell 0 is left empty for the caption, so type and stickers never collide.
+    const bph = (c.beat + r1) % 1;
+    const bounce = Math.abs(Math.sin(bph * Math.PI));
+    const land = easeOutExpo(Math.min(1, bph * 5)); // squash right after impact
     const cols = 4;
-    const gi = i + 1;
-    const gxi = gi % cols;
-    const gyi = Math.floor(gi / cols);
+    const gxi = i % cols;
+    const gyi = Math.floor(i / cols);
     const x = ((gxi + 0.2 + r1 * 0.6) / cols) * w;
-    const y = ((gyi + 0.2 + r2 * 0.55) / 2) * h * 0.6 + h * 0.05 - bounce * h * 0.04;
+    const y =
+      ((gyi + 0.2 + r2 * 0.55) / 2) * h * 0.56 + h * 0.05 - bounce * h * 0.11;
     const s = (0.09 + r2 * 0.06) * Math.min(w, h);
     const kind = i % 3;
     ctx.save();
     ctx.translate(x, y);
-    ctx.rotate((r1 - 0.5) * 0.5);
+    ctx.rotate((r1 - 0.5) * 0.5 + Math.sin(c.beat * 0.5 + i) * 0.12);
+    ctx.scale(1 + (1 - land) * 0.16, 1 - (1 - land) * 0.16);
     const paint = (fill: string, dx: number, dy: number) => {
       ctx.save();
       ctx.translate(dx, dy);
@@ -531,11 +584,22 @@ function drawKawaii(ctx: CanvasRenderingContext2D, w: number, h: number, c: Cloc
     ctx.restore();
   }
 
-  // Type, set small and low — the sheet's caption.
-  label(ctx, 'kawaii', m, h * 0.14, w * 0.014, outline);
-  ctx.fillStyle = outline;
-  condensed(ctx, w * 0.016);
-  ctx.fillText(`${Math.round(c.bpm)} BPM`, m, h * 0.175);
+  // Phrase move: a big star crosses the sheet every 8 beats, spinning.
+  const cross = stagger(c.beat, 8, 4);
+  if (cross > 0 && cross < 1) {
+    const e = easeInOutCubic(cross);
+    ctx.save();
+    ctx.translate(-w * 0.1 + e * w * 1.2, h * 0.5 - Math.sin(e * Math.PI) * h * 0.18);
+    ctx.rotate(e * TAU);
+    ctx.fillStyle = c1(c, 3);
+    ctx.strokeStyle = outline;
+    ctx.lineWidth = Math.min(w, h) * 0.014;
+    ctx.lineJoin = 'round';
+    starPath(ctx, Math.min(w, h) * 0.09);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
 }
 
 // ---- Shapes ----------------------------------------------------------------

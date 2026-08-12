@@ -1,9 +1,9 @@
 /**
- * Print toolkit — the shared texture/typography vocabulary the presets draw with.
+ * Print toolkit — the shared texture vocabulary the presets draw with.
  *
  * The techniques here (halftone screens, paper grain, deliberate ink
- * misregistration, cropped condensed type) are what screen-printed and riso'd
- * club flyers actually look like. They are also cheap: patterns are built once
+ * misregistration) are what screen-printed and riso'd club flyers actually
+ * look like. They are also cheap: patterns are built once
  * per canvas and cached, so a full-frame texture costs one fillRect instead of
  * tens of thousands of arcs.
  */
@@ -163,65 +163,5 @@ export function misregister(
   ctx.fillStyle = inkB;
   ctx.strokeStyle = inkB;
   paint(ctx);
-  ctx.restore();
-}
-
-/**
- * Set a condensed grotesque. Arial Narrow ships on every Mac, so this is a real
- * condensed face rather than a horizontally squashed one.
- */
-export function condensed(
-  ctx: CanvasRenderingContext2D,
-  size: number,
-  weight: 400 | 700 = 700,
-) {
-  ctx.font = `${weight} ${size}px "Arial Narrow", "Helvetica Neue", Helvetica, sans-serif`;
-}
-
-/** Small uppercase label with wide tracking — the annotation voice. */
-export function label(
-  ctx: CanvasRenderingContext2D,
-  text: string,
-  x: number,
-  y: number,
-  size: number,
-  color: string,
-  tracking = 0.18,
-) {
-  ctx.save();
-  ctx.font = `700 ${size}px "Helvetica Neue", Helvetica, sans-serif`;
-  ctx.fillStyle = color;
-  ctx.textBaseline = 'alphabetic';
-  let cx = x;
-  for (const ch of text.toUpperCase()) {
-    ctx.fillText(ch, cx, y);
-    cx += ctx.measureText(ch).width + size * tracking;
-  }
-  ctx.restore();
-}
-
-/** Two-digit counter string, e.g. bar 3 of 4 -> "03". */
-export function pad2(n: number): string {
-  return String(Math.floor(n)).padStart(2, '0');
-}
-
-/** Printer's registration target — a small crosshair mark. */
-export function regMark(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  r: number,
-  color: string,
-) {
-  ctx.save();
-  ctx.strokeStyle = color;
-  ctx.lineWidth = Math.max(1, r * 0.09);
-  ctx.beginPath();
-  ctx.arc(x, y, r * 0.6, 0, TAU);
-  ctx.moveTo(x - r, y);
-  ctx.lineTo(x + r, y);
-  ctx.moveTo(x, y - r);
-  ctx.lineTo(x, y + r);
-  ctx.stroke();
   ctx.restore();
 }
