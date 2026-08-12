@@ -1,5 +1,19 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type { AppStatus, ChannelId, ChannelStatus, Quality } from './preload';
+import type {
+  AppStatus,
+  ChannelId,
+  ChannelStatus,
+  Mode,
+  Quality,
+} from './preload';
+import { GenCanvas } from './GenView';
+import {
+  DEFAULT_GEN_PARAMS,
+  GENRES,
+  MAX_BPM,
+  MIN_BPM,
+  type Genre,
+} from './gen/params';
 
 /** True if the input looks like a URL (has a scheme or a bare domain), rather
  * than a free-text search query. */
@@ -77,6 +91,14 @@ const EMPTY_STATUS: AppStatus = {
     serverName: 'TubeToSyphon',
     error: null,
   },
+  gen: {
+    running: false,
+    hasClients: false,
+    fps: 0,
+    serverName: 'TubeToSyphon-GEN',
+    error: null,
+  },
+  genParams: DEFAULT_GEN_PARAMS,
 };
 
 // mm:ss (or h:mm:ss) for the transport time labels.
@@ -409,7 +431,7 @@ function VjBar({ status }: { status: AppStatus }) {
   const vjMode = status.mode === 'vj';
   const vj = status.vj;
 
-  const setMode = async (mode: 'dual' | 'vj') => {
+  const setMode = async (mode: Mode) => {
     const res = await window.api.setMode(mode);
     if (!res.ok && res.error) alert(res.error);
   };
@@ -420,7 +442,7 @@ function VjBar({ status }: { status: AppStatus }) {
     <div className="vjbar">
       <div className="modes">
         <button
-          className={vjMode ? '' : 'primary'}
+          className={status.mode === 'dual' ? 'primary' : ''}
           onClick={() => setMode('dual')}
         >
           Dual (2 out)
@@ -430,6 +452,13 @@ function VjBar({ status }: { status: AppStatus }) {
           onClick={() => setMode('vj')}
         >
           VJ (1 out)
+        </button>
+        <button
+          className={status.mode === 'gen' ? 'primary' : ''}
+          onClick={() => setMode('gen')}
+          title="BPM/ジャンル駆動の汎用グラフィックスを出力"
+        >
+          汎用 (Generative)
         </button>
       </div>
 
@@ -467,6 +496,128 @@ function VjBar({ status }: { status: AppStatus }) {
   );
 }
 
+/**
+ * 汎用 (generic) mode panel: the musical clock + look controls, and a live
+ * preview of exactly the frame the offscreen window is publishing to Syphon.
+ */
+function GenPanel({ status }: { status: AppStatus }) {
+  const p = status.genParams;
+  const gen = status.gen;
+  // Tap-tempo timestamps (most recent last). Kept in a ref — taps don't need to
+  // re-render anything by themselves.
+  const taps = useRef<number[]>([]);
+
+  const patch = (next: Partial<typeof p>) => window.api.setGenParams(next);
+
+  const tap = () => {
+    const now = Date.now();
+    // A gap longer than 2s starts a new measurement.
+    if (taps.current.length && now - taps.current[taps.current.length - 1] > 2000) {
+      taps.current = [];
+    }
+    taps.current.push(now);
+    if (taps.current.length > 5) taps.current.shift();
+    if (taps.current.length >= 2) {
+      const first = taps.current[0];
+      const spans = taps.current.length - 1;
+      const bpm = 60000 / ((now - first) / spans);
+      // The last tap is a beat, so anchor the grid to it as well.
+      patch({ bpm: Math.round(bpm * 10) / 10, beatEpoch: now });
+    } else {
+      patch({ beatEpoch: now });
+    }
+  };
+
+  const changeGenre = (genre: Genre) => {
+    // Adopt the genre's typical tempo so the preset lands in a sensible range.
+    const preset = GENRES.find((g) => g.value === genre);
+    patch({ genre, bpm: preset?.bpm ?? p.bpm });
+  };
+
+  return (
+    <div className="genpanel">
+      <div className="gencontrols">
+        <div className="genrow">
+          <label className="quality">
+            Genre:
+            <select
+              value={p.genre}
+              onChange={(e) => changeGenre(e.target.value as Genre)}
+            >
+              {GENRES.map((g) => (
+                <option key={g.value} value={g.value}>
+                  {g.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="quality">
+            BPM:
+            <input
+              className="bpm"
+              type="number"
+              min={MIN_BPM}
+              max={MAX_BPM}
+              step={0.1}
+              value={p.bpm}
+              onChange={(e) => patch({ bpm: Number(e.target.value) })}
+            />
+          </label>
+          <button onClick={tap} title="Tap 4 times on the beat">
+            Tap
+          </button>
+          <button
+            onClick={() => patch({ beatEpoch: Date.now() })}
+            title="Re-align the beat grid to right now"
+          >
+            Sync
+          </button>
+        </div>
+
+        <div className="genrow">
+          <label className="quality slider">
+            Intensity
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={p.intensity}
+              onChange={(e) => patch({ intensity: Number(e.target.value) })}
+            />
+          </label>
+          <label className="quality slider">
+            Hue
+            <input
+              className="hue"
+              type="range"
+              min={0}
+              max={359}
+              step={1}
+              value={p.hue}
+              onChange={(e) => patch({ hue: Number(e.target.value) })}
+            />
+          </label>
+        </div>
+
+        <div className="statusline">
+          <span className={`dot ${gen.running ? 'on' : 'off'}`} />
+          <b>{gen.serverName}</b>
+          <span>· {gen.fps} fps</span>
+          <span>· {gen.hasClients ? 'connected' : 'no receiver'}</span>
+          <span>· 1920×1080</span>
+        </div>
+        {gen.error && <div className="statusline error">{gen.error}</div>}
+      </div>
+
+      <div className="genpreview">
+        <GenCanvas params={p} width={640} height={360} className="genthumb" />
+        <div className="genhint">Preview (live) — output goes to Syphon</div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [status, setStatus] = useState<AppStatus>(EMPTY_STATUS);
 
@@ -477,11 +628,15 @@ export default function App() {
   }, []);
 
   const vjMode = status.mode === 'vj';
+  const genMode = status.mode === 'gen';
 
   return (
     <div className="app">
       <VjBar status={status} />
-      <div className="players">
+      {genMode && <GenPanel status={status} />}
+      {/* Kept mounted but hidden in 汎用 mode: unmounting would destroy the
+          <webview>s and lose whatever the user had loaded. */}
+      <div className="players" style={genMode ? { display: 'none' } : undefined}>
         <Player channel="left" status={status.left} vjMode={vjMode} />
         <div className="divider" />
         <Player channel="right" status={status.right} vjMode={vjMode} />

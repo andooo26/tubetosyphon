@@ -90,3 +90,6 @@ typings/
 
 # Electron-Forge
 out/
+
+# Packaged app output
+dist/

@@ -3,6 +3,11 @@ import path from 'node:path';
 import started from 'electron-squirrel-startup';
 import { SyphonManager } from './syphon';
 import type { Quality } from './preload';
+import {
+  DEFAULT_GEN_PARAMS,
+  clampGenParams,
+  type GenParams,
+} from './gen/params';
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (started) {
@@ -100,7 +105,7 @@ function getChannel(id: unknown): Channel | null {
 // mode the per-channel Syphon servers are stopped; both channels keep capturing
 // (into ch.latest) and a single mixer blends L/R by vjAlpha and publishes to one
 // server. In 'dual' mode each channel publishes to its own server as before.
-type Mode = 'dual' | 'vj';
+type Mode = 'dual' | 'vj' | 'gen';
 let mode: Mode = 'dual';
 let vjAlpha = 0; // 0 = full A (left), 1 = full B (right)
 // Active crossfade animation (Cut A/B fade over a duration instead of jumping).
@@ -114,6 +119,20 @@ let vjMeasuredFps = 0;
 const VJ_INTERVAL_MS = 16; // ~60fps output
 
 let mainWindow: BrowserWindow | null = null;
+
+// ---- 汎用 (generic) mode --------------------------------------------------
+// No video source at all: a hidden 1920x1080 **offscreen** BrowserWindow renders
+// the generative sketch (src/gen/sketch.ts, same bundle as the UI, loaded with
+// ?gen=1) driven by BPM + genre, and every painted frame is published to a
+// single Syphon server. Offscreen rendering hands us the finished 1920x1080
+// BGRA bitmap directly, so there is no crop/letterbox step here.
+const genSyphon = new SyphonManager('TubeToSyphon-GEN');
+let genWindow: BrowserWindow | null = null;
+let genParams: GenParams = { ...DEFAULT_GEN_PARAMS, beatEpoch: Date.now() };
+let genFramesThisSecond = 0;
+let genLastFpsStamp = Date.now();
+let genMeasuredFps = 0;
+const GEN_FPS = 60;
 
 // A YouTube *playback* URL (watch / shorts / youtu.be) as opposed to a browse
 // page (home, search results, channel). Only playback pages get the
@@ -335,6 +354,20 @@ function pushQuality(ch: Channel) {
     .catch((): void => {});
 }
 
+// Load the renderer bundle into `win`. `search` selects which root it mounts
+// ('' = the normal UI, 'gen=1' = the offscreen generative canvas).
+function loadRenderer(win: BrowserWindow, search = '') {
+  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+    const q = search ? `?${search}` : '';
+    win.loadURL(`${MAIN_WINDOW_VITE_DEV_SERVER_URL}${q}`);
+  } else {
+    win.loadFile(
+      path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
+      search ? { search } : undefined,
+    );
+  }
+}
+
 const createWindow = () => {
   mainWindow = new BrowserWindow({
     width: 1680,
@@ -348,13 +381,14 @@ const createWindow = () => {
     },
   });
 
-  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
-  } else {
-    mainWindow.loadFile(
-      path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
-    );
-  }
+  // The hidden generative window is a BrowserWindow too, so it would keep
+  // 'window-all-closed' from ever firing; tear it down with the UI.
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+    stopGen();
+  });
+
+  loadRenderer(mainWindow);
 };
 
 // ---- Capture loop (per channel) -------------------------------------------
@@ -650,25 +684,142 @@ function stopVjTimer() {
   vjMeasuredFps = 0;
 }
 
+// ---- 汎用 (generic) generative output --------------------------------------
+
+function countGenFrame() {
+  genFramesThisSecond++;
+  const now = Date.now();
+  if (now - genLastFpsStamp >= 1000) {
+    genMeasuredFps = genFramesThisSecond;
+    genFramesThisSecond = 0;
+    genLastFpsStamp = now;
+    sendStatus({});
+  }
+}
+
+// Push the current params into the offscreen window (and mirror them to the UI
+// so its preview draws exactly the same thing).
+function pushGenParams() {
+  genWindow?.webContents.send('app:gen-params', genParams);
+}
+
+function createGenWindow() {
+  if (genWindow && !genWindow.isDestroyed()) return;
+  genWindow = new BrowserWindow({
+    width: OUT_W,
+    height: OUT_H,
+    show: false,
+    frame: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      offscreen: true,
+      // The window is never visible, so Chromium would otherwise throttle
+      // requestAnimationFrame down to a crawl and the output would stutter.
+      backgroundThrottling: false,
+    },
+  });
+  const wc = genWindow.webContents;
+  wc.setFrameRate(GEN_FPS);
+  // Electron has changed this event's argument list across versions (dirty-rect
+  // + image vs. a details object), so pick the NativeImage out of whatever
+  // arrives instead of relying on a fixed position.
+  wc.on('paint', (...args: unknown[]) => {
+    const image = args.find(
+      (a): a is Electron.NativeImage =>
+        !!a && typeof (a as Electron.NativeImage).getBitmap === 'function',
+    );
+    if (image) onGenPaint(image);
+  });
+  wc.on('did-finish-load', pushGenParams);
+  genWindow.on('closed', () => {
+    genWindow = null;
+  });
+  loadRenderer(genWindow, 'gen=1');
+}
+
+function onGenPaint(image: Electron.NativeImage) {
+  if (mode !== 'gen' || !genSyphon.isRunning) return;
+  try {
+    if (image.isEmpty()) return;
+    const size = image.getSize();
+    // getBitmap() hands back the underlying BGRA pixels with no copy (unlike
+    // toBitmap()), which matters at 1080p60 — we publish synchronously here, so
+    // the "don't hold on to it" caveat is satisfied. Cast: Electron's own .d.ts
+    // mistypes the return as void.
+    const bgra = (image as unknown as { getBitmap(): Buffer }).getBitmap();
+    // Guard against a scale-factor slip (the bitmap can come back at 2x the
+    // logical size): derive the true pixel dimensions from the buffer length.
+    let w = size.width;
+    let h = size.height;
+    const px = bgra.length / 4;
+    if (w > 0 && h > 0 && px !== w * h) {
+      const k = Math.round(Math.sqrt(px / (w * h)));
+      if (k > 1) {
+        w *= k;
+        h *= k;
+      }
+    }
+    if (w <= 0 || h <= 0 || bgra.length < w * h * 4) return;
+    if (genSyphon.publishBGRA(bgra, w, h)) countGenFrame();
+  } catch (err) {
+    sendStatus({ error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+function startGen(): { ok: boolean; error?: string } {
+  if (!genSyphon.start()) {
+    return { ok: false, error: genSyphon.error ?? 'gen start failed' };
+  }
+  genLastFpsStamp = Date.now();
+  genFramesThisSecond = 0;
+  createGenWindow();
+  pushGenParams();
+  return { ok: true };
+}
+
+function stopGen() {
+  if (genWindow && !genWindow.isDestroyed()) genWindow.destroy();
+  genWindow = null;
+  genSyphon.dispose();
+  genMeasuredFps = 0;
+}
+
 // Switch between 'dual' and 'vj'. Entering VJ stops the per-channel servers,
 // starts the single mixed server, and makes sure both channels are capturing.
 // Leaving VJ tears the mixer down and stops capture (dual outputs start on demand).
 function setMode(next: Mode): { ok: boolean; error?: string } {
   if (next === mode) return { ok: true };
+
+  // Tear the previous mode down first — every mode owns its own Syphon
+  // server(s), and only one mode's outputs may be live at a time.
+  stopVjTimer();
+  vjSyphon.dispose();
+  stopGen();
+  for (const ch of Object.values(channels)) {
+    stopCapture(ch);
+    ch.syphon.dispose();
+  }
+
   if (next === 'vj') {
-    // Only one Syphon output in VJ mode: stop the two per-channel servers.
-    for (const ch of Object.values(channels)) {
-      stopCapture(ch);
-      ch.syphon.dispose();
+    if (!vjSyphon.start()) {
+      return { ok: false, error: vjSyphon.error ?? 'vj start failed' };
     }
-    if (!vjSyphon.start()) return { ok: false, error: vjSyphon.error ?? 'vj start failed' };
     mode = 'vj';
     for (const ch of Object.values(channels)) startCapture(ch);
     startVjTimer();
+  } else if (next === 'gen') {
+    // No capture at all in 汎用 mode: the players stay loaded but idle.
+    mode = 'gen';
+    const res = startGen();
+    if (!res.ok) {
+      mode = 'dual';
+      sendStatus({});
+      return res;
+    }
   } else {
-    stopVjTimer();
-    vjSyphon.dispose();
-    for (const ch of Object.values(channels)) stopCapture(ch);
+    // Dual: per-channel outputs start on demand via "Start Syphon".
     mode = 'dual';
   }
   sendStatus({});
@@ -723,6 +874,14 @@ function appStatus() {
       serverName: 'TubeToSyphon',
       error: vjSyphon.error,
     },
+    gen: {
+      running: genSyphon.isRunning,
+      hasClients: genSyphon.hasClients,
+      fps: genMeasuredFps,
+      serverName: 'TubeToSyphon-GEN',
+      error: genSyphon.error,
+    },
+    genParams,
   };
 }
 
@@ -732,7 +891,9 @@ function sendStatus(extra: { error?: string }) {
     status.left = { ...status.left, error: extra.error };
     status.right = { ...status.right, error: extra.error };
   }
-  mainWindow?.webContents.send('app:status', status);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('app:status', status);
+  }
 }
 
 // ---- IPC ------------------------------------------------------------------
@@ -760,7 +921,7 @@ ipcMain.handle(
 ipcMain.handle('app:start-output', (_e, channelId: ChannelId) => {
   const ch = getChannel(channelId);
   if (!ch) return { ok: false, error: 'unknown channel' };
-  if (mode === 'vj') return { ok: false, error: 'switch to Dual mode first' };
+  if (mode !== 'dual') return { ok: false, error: 'switch to Dual mode first' };
   if (!ch.syphon.start()) {
     return { ok: false, error: ch.syphon.error };
   }
@@ -831,8 +992,21 @@ ipcMain.handle(
 );
 
 ipcMain.handle('app:set-mode', (_e, next: Mode) => {
-  if (next !== 'dual' && next !== 'vj') return { ok: false, error: 'bad mode' };
+  if (next !== 'dual' && next !== 'vj' && next !== 'gen') {
+    return { ok: false, error: 'bad mode' };
+  }
   return setMode(next);
+});
+
+// Update the generative params (partial patch: the UI sends only what changed).
+ipcMain.handle('app:set-gen-params', (_e, patch: Partial<GenParams>) => {
+  if (!patch || typeof patch !== 'object') {
+    return { ok: false, error: 'bad params' };
+  }
+  genParams = clampGenParams(patch, genParams);
+  pushGenParams();
+  sendStatus({});
+  return { ok: true };
 });
 
 ipcMain.handle('app:set-vj-alpha', (_e, alpha: number) => {
@@ -869,6 +1043,7 @@ app.on('ready', createWindow);
 app.on('window-all-closed', () => {
   stopVjTimer();
   vjSyphon.dispose();
+  stopGen();
   for (const ch of Object.values(channels)) {
     stopCapture(ch);
     ch.syphon.dispose();
