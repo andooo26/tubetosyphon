@@ -95,7 +95,9 @@ export function halftone(
   let pat: CanvasPattern | null = null;
   if (t) {
     const [cv, tc] = t;
-    const r = (cell / 2) * Math.sqrt(Math.min(1, Math.max(0, fill)));
+    // Hard cap at 0.42: the two dots in the tile are 0.707·cell apart, so beyond
+    // that they touch and the screen flips from a dot field to a checkerboard.
+    const r = (cell / 2) * Math.sqrt(Math.min(0.42, Math.max(0, fill)));
     tc.fillStyle = color;
     // Two dots on the diagonal give the classic 45° screen angle.
     for (const [x, y] of [

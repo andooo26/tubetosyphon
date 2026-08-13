@@ -27,11 +27,18 @@ import { grain, halftone, lineScreen, misregister } from './print';
 
 const TAU = Math.PI * 2;
 
-/** Deterministic pseudo-random in [0,1) — same value for the same index. */
-function rnd(i: number): number {
-  const x = Math.sin(i * 127.1 + 311.7) * 43758.5453;
+/**
+ * Three-input hash. Every random choice runs through this rather than
+ * Math.random(), so the offscreen output window and the on-screen preview draw
+ * identical frames from the same (seed, phrase, index).
+ */
+function hash3(a: number, b: number, i: number): number {
+  const x = Math.sin(a * 374.761 + b * 668.265 + i * 127.113 + 311.7) * 43758.5453;
   return x - Math.floor(x);
 }
+
+/** How many beats a "scene" lasts before every seeded choice re-rolls. */
+const PHRASE_BEATS = 8;
 
 /** Smooth 0..1 triangle-ish wave over `period` beats. */
 function wave(beat: number, period: number): number {
@@ -60,11 +67,17 @@ interface Clock {
   env: number;
   /** Envelope on the downbeat (every 4th beat) only. */
   bar: number;
-  /** 0..1 intensity. */
+  /** 0..1 intensity. Above ~0.6 the director starts cutting and strobing. */
   I: number;
   /** This preset's palette, and the tint rotation applied to its spot inks. */
   pal: Palette;
   shift: number;
+  /** Index of the current 8-beat scene. */
+  phrase: number;
+  /** Random, stable for this whole scene — layout choices that shouldn't flicker. */
+  rand: (i: number) => number;
+  /** Random for an arbitrary index (e.g. a 16th-note step), mixed with the seed. */
+  noise: (a: number, i: number) => number;
 }
 
 /** Spot ink helper bound to the current clock. */
@@ -85,26 +98,79 @@ export function drawGen(
 ): void {
   const bpm = Math.max(20, Math.min(300, p.bpm));
   const beatMs = 60000 / bpm;
-  const beat = (nowMs - p.beatEpoch) / beatMs;
+  const rawBeat = (nowMs - p.beatEpoch) / beatMs;
+  const pal = PALETTES[p.genre] ?? PALETTES.techno;
+  const I = p.intensity;
+  const seed = p.seed;
+  const phrase = Math.floor(rawBeat / PHRASE_BEATS);
+
+  // ---- Director -----------------------------------------------------------
+  // A layer above the presets that behaves like someone playing the visuals:
+  // it cuts the camera, freezes the clock, shakes on hits and strobes. All of it
+  // is hashed off (seed, scene) so it is repeatable, and all of it scales with
+  // Intensity — at 0 the presets play straight, at 1 they get worked.
+
+  // Cut the camera every N beats; faster when Intensity is up.
+  const cutEvery = I > 0.72 ? 2 : I > 0.45 ? 4 : I > 0.2 ? 8 : 16;
+  const cutIdx = Math.floor(rawBeat / cutEvery);
+  const camPick = hash3(seed, cutIdx, 91);
+  const camOn = camPick < 0.15 + I * 0.6;
+
+  // Stutter: for one beat in a scene the clock is quantised to 16ths, so the
+  // motion machine-guns instead of flowing. Only at higher intensities.
+  const stutterBeat = Math.floor(hash3(seed, phrase, 17) * PHRASE_BEATS);
+  const stuttering =
+    I > 0.5 && Math.floor(rawBeat % PHRASE_BEATS) === stutterBeat;
+  const beat = stuttering ? Math.floor(rawBeat * 4) / 4 : rawBeat;
+
   const phase = beat - Math.floor(beat);
   const barPhase = (beat / 4) % 1;
-  const pal = PALETTES[p.genre] ?? PALETTES.techno;
   const c: Clock = {
     beat,
     t: (nowMs - p.beatEpoch) / 1000,
     phase,
     env: Math.pow(1 - phase, 3),
     bar: Math.pow(1 - barPhase, 5),
-    I: p.intensity,
+    I,
     pal,
     shift: tintShift(p.hue),
+    phrase,
+    rand: (i: number) => hash3(seed, phrase, i),
+    noise: (a: number, i: number) => hash3(seed, a, i),
   };
 
   ctx.save();
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
+  // Paper goes down untransformed so a zoomed or mirrored camera can never
+  // expose a bare corner.
   ctx.fillStyle = paperColor(pal, c.shift);
   ctx.fillRect(0, 0, w, h);
+
+  ctx.save();
+  ctx.translate(w / 2, h / 2);
+  if (camOn) {
+    // Only mirrors, 180° flips and zoom-ins: every one of them still covers the
+    // full frame, so no transform can reveal an edge.
+    const kind = Math.floor(hash3(seed, cutIdx, 33) * 4);
+    if (kind === 0) ctx.scale(-1, 1);
+    else if (kind === 1) ctx.scale(1, -1);
+    else if (kind === 2) ctx.rotate(Math.PI);
+    const zoom = 1 + hash3(seed, cutIdx, 55) * 0.5 * I;
+    ctx.scale(zoom, zoom);
+    // Push the framing off centre so a zoom crops somewhere specific.
+    ctx.translate(
+      (hash3(seed, cutIdx, 77) - 0.5) * w * 0.12 * I,
+      (hash3(seed, cutIdx, 88) - 0.5) * h * 0.12 * I,
+    );
+  }
+  // Hit shake, direction re-rolled every beat.
+  const shake = c.env * I * I * 0.02;
+  ctx.translate(
+    (hash3(seed, Math.floor(beat), 5) - 0.5) * w * shake,
+    (hash3(seed, Math.floor(beat), 6) - 0.5) * h * shake,
+  );
+  ctx.translate(-w / 2, -h / 2);
 
   switch (p.genre) {
     case 'techno':
@@ -128,6 +194,32 @@ export function drawGen(
     case 'kawaii':
       drawKawaii(ctx, w, h, c);
       break;
+  }
+
+  ctx.restore(); // end camera
+
+  // Strobe. Two flavours, both full-strength and both about one frame long at
+  // 60fps — a partial-alpha flash just greys the picture out.
+  if (I > 0.45) {
+    const strobeRate = I > 0.8 ? 4 : I > 0.62 ? 2 : 1; // hits per beat
+    const sp = (beat * strobeRate) % 1;
+    const chance = hash3(seed, Math.floor(beat * strobeRate), 41);
+    // ~5% of each hit's window, so even at full intensity the picture is on
+    // screen the overwhelming majority of the time. A longer duty cycle stops
+    // reading as a strobe and starts hiding the visual behind flat colour.
+    if (sp < 0.05 && chance < (I - 0.45) * 1.4) {
+      // Mostly the negative flash; the solid ink flood is the rarer, harder hit.
+      if (chance > 0.12) {
+        // Negative: reads as a camera flash on dark stock and as ink on light.
+        ctx.globalCompositeOperation = 'difference';
+        ctx.fillStyle = '#fff';
+      } else {
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.fillStyle = ink(pal, 0, c.shift);
+      }
+      ctx.fillRect(0, 0, w, h);
+      ctx.globalCompositeOperation = 'source-over';
+    }
   }
 
   // Shared finish: paper grain only. No vignette — a dark ring around every
@@ -155,7 +247,7 @@ function drawTechno(ctx: CanvasRenderingContext2D, w: number, h: number, c: Cloc
     const trail = age === 0 ? 1 - sub * 0.15 : Math.max(0, 1 - age / 4);
     for (let y = 0; y < rows; y++) {
       // Fixed programme per column: which rows light up when it is hit.
-      const on = rnd(x * 13 + y * 71) < 0.3 + c.I * 0.3;
+      const on = c.rand(x * 13 + y * 71) < 0.18 + c.I * 0.5;
       const rx = x * cw + pad;
       const ry = y * ch + pad;
       const rw = cw - pad * 2;
@@ -212,7 +304,12 @@ function drawHouse(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock
   const rulings = [26, 16, 10];
 
   for (let i = 0; i < discs.length; i++) {
-    const [fx, fy, fr, inkIdx] = discs[i];
+    const [fx0, fy0, fr0, inkIdx] = discs[i];
+    // Re-composed every scene: positions and sizes jitter, so the same three
+    // discs never sit in the same arrangement twice.
+    const fx = fx0 + (c.rand(i * 3) - 0.5) * 0.22;
+    const fy = fy0 + (c.rand(i * 3 + 1) - 0.5) * 0.16;
+    const fr = fr0 * (0.75 + c.rand(i * 3 + 2) * 0.6);
     // Each disc orbits its own small circle, staggered a beat apart, so the
     // group is never in phase with itself.
     const a = c.beat * 0.16 + (i * TAU) / 3;
@@ -293,7 +390,8 @@ function drawDnb(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) 
 
   const bands = 9;
   for (let i = 0; i < bands; i++) {
-    const jump = (rnd(step * 17 + i * 5) - 0.5) * w * 0.1 * (0.35 + c.I);
+    const jump =
+      (c.noise(step, i * 5) - 0.5) * w * 0.06 * (0.3 + c.I * 3.2);
     ctx.save();
     ctx.beginPath();
     ctx.rect(0, (i / bands) * h, w, h / bands + 1);
@@ -318,7 +416,7 @@ function drawDnb(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) 
   }
 
   // A hard vertical shutter that jumps to a new column every 8th note.
-  const shutter = rnd(Math.floor(c.beat * 2) * 3 + 7);
+  const shutter = c.noise(Math.floor(c.beat * 2), 7);
   ctx.fillStyle = ink(c.pal, 2, c.shift, 0.9 * sub);
   ctx.fillRect(w * shutter, 0, Math.max(2, w * 0.004), h);
 
@@ -342,8 +440,9 @@ function drawHipHop(ctx: CanvasRenderingContext2D, w: number, h: number, c: Cloc
 
   // Red block slides between four positions, one per beat, easing out hard.
   const slots = [0.1, 0.36, 0.2, 0.5];
-  const from = slots[(beatIdx + 3) % 4];
-  const to = slots[beatIdx];
+  const rot = Math.floor(c.rand(2) * 4); // scene picks where the cycle starts
+  const from = slots[(beatIdx + 3 + rot) % 4];
+  const to = slots[(beatIdx + rot) % 4];
   const slide = from + (to - from) * easeOutExpo(Math.min(1, c.phase * 2.2));
   ctx.fillStyle = c1(c, 1);
   ctx.fillRect(w * 0.5, h * slide, w * 0.44, h * (0.24 + c.I * 0.1));
@@ -464,10 +563,12 @@ function drawPop(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) 
     ctx.fillRect(0, h * 0.62, w, h * 0.38);
   }
 
-  const ax = w * (0.66 - 0.3 * t);
-  const bx = w * (0.34 + 0.34 * t);
-  const ar = Math.min(w, h) * (0.19 + c.env * 0.02 * c.I);
-  const bs = Math.min(w, h) * 0.3;
+  const travel = 0.22 + c.rand(4) * 0.3;
+  const flip = c.rand(5) < 0.5 ? 1 : -1;
+  const ax = w * (0.5 + flip * (0.16 - travel * t));
+  const bx = w * (0.5 - flip * (0.16 - travel * t));
+  const ar = Math.min(w, h) * (0.15 + c.rand(6) * 0.1 + c.env * 0.02 * c.I);
+  const bs = Math.min(w, h) * (0.24 + c.rand(7) * 0.12);
 
   misregister(
     ctx,
@@ -548,8 +649,8 @@ function drawKawaii(ctx: CanvasRenderingContext2D, w: number, h: number, c: Cloc
   // squashing on landing.
   const items = 6 + Math.round(c.I * 2);
   for (let i = 0; i < items; i++) {
-    const r1 = rnd(i * 3 + 1);
-    const r2 = rnd(i * 5 + 2);
+    const r1 = c.rand(i * 3 + 1);
+    const r2 = c.rand(i * 5 + 2);
     const bph = (c.beat + r1) % 1;
     const bounce = Math.abs(Math.sin(bph * Math.PI));
     const land = easeOutExpo(Math.min(1, bph * 5)); // squash right after impact

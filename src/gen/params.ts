@@ -25,6 +25,13 @@ export interface GenParams {
   hue: number;
   /** ms timestamp of "beat 0". Tap tempo / Sync resets it to re-align the phase. */
   beatEpoch: number;
+  /**
+   * Base seed for every random choice in the sketch. Randomness is hashed from
+   * (seed, phrase, index) rather than Math.random(), so the offscreen output and
+   * the preview roll exactly the same numbers — and re-rolling the seed changes
+   * the whole piece without changing a parameter.
+   */
+  seed: number;
 }
 
 // Typical tempo per genre — picked when the user switches genre so the visuals
@@ -48,6 +55,7 @@ export const DEFAULT_GEN_PARAMS: GenParams = {
   intensity: 0.6,
   hue: 205,
   beatEpoch: 0, // 0 => "start of stream"; the renderer substitutes its own start
+  seed: 1,
 };
 
 export function clampGenParams(p: Partial<GenParams>, base: GenParams): GenParams {
@@ -64,11 +72,14 @@ export function clampGenParams(p: Partial<GenParams>, base: GenParams): GenParam
     typeof p.beatEpoch === 'number' && isFinite(p.beatEpoch)
       ? p.beatEpoch
       : base.beatEpoch;
+  const seed =
+    typeof p.seed === 'number' && isFinite(p.seed) ? p.seed : base.seed;
   return {
     bpm: Math.min(MAX_BPM, Math.max(MIN_BPM, bpm)),
     genre,
     intensity: Math.min(1, Math.max(0, intensity)),
     hue: ((hue % 360) + 360) % 360,
     beatEpoch,
+    seed: Math.abs(Math.floor(seed)) % 100000,
   };
 }

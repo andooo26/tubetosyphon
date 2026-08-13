@@ -588,6 +588,15 @@ function GenPanel({ status }: { status: AppStatus }) {
 
         <div className="genhead">Look</div>
         <div className="genrow">
+          <button
+            onClick={() => patch({ seed: Math.floor(Math.random() * 100000) })}
+            title="構図・配色の乱数を引き直す（8拍ごとの自動変化とは別）"
+          >
+            Shuffle
+          </button>
+          <span className="genhint num">seed {p.seed}</span>
+        </div>
+        <div className="genrow">
           <label className="quality slider">
             Intensity
             <input
