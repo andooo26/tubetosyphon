@@ -84,6 +84,19 @@ export const PALETTES: Record<Genre, Palette> = {
     ],
     light: true,
   },
+  // Blown-out candy: maximum-chroma magenta, cyan and acid yellow on black,
+  // plus a peak-red used only where the signal clips. Nothing muted anywhere —
+  // the palette is doing what the mastering isn't.
+  hyperpop: {
+    paper: [280, 30, 4],
+    inks: [
+      [322, 100, 60],
+      [186, 100, 55],
+      [56, 100, 60],
+      [2, 100, 58],
+    ],
+    light: false,
+  },
   // Y2K sticker sheet: pastel pink stock, hot pink + sky, hard black outline.
   kawaii: {
     paper: [340, 62, 90],

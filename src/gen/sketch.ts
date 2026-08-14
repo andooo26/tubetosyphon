@@ -194,6 +194,9 @@ export function drawGen(
     case 'kawaii':
       drawKawaii(ctx, w, h, c);
       break;
+    case 'hyperpop':
+      drawHyperpop(ctx, w, h, c);
+      break;
   }
 
   ctx.restore(); // end camera
@@ -700,6 +703,140 @@ function drawKawaii(ctx: CanvasRenderingContext2D, w: number, h: number, c: Cloc
     ctx.fill();
     ctx.stroke();
     ctx.restore();
+  }
+}
+
+// ---- Hyperpop / 音割れ: a waveform driven past its ceiling ------------------
+//
+// The whole preset is built on one idea: clipping. A waveform is pushed until it
+// hits a hard ceiling and squares off, the clipped samples turn peak-red, and
+// everything else in the frame — the RGB split, the shapes, the cuts — is the
+// distortion that follows from being too loud. That is what the music is doing,
+// so it is what the picture does.
+
+function drawHyperpop(ctx: CanvasRenderingContext2D, w: number, h: number, c: Clock) {
+  const step = Math.floor(c.beat * 4); // 16ths: this genre lives on them
+  const sub = c.beat * 4 - step;
+  const hit = easeOutExpo(Math.min(1, sub * 3));
+  const cy = h * 0.5;
+
+  // Candy bands behind everything, re-cut every 16th.
+  const bands = 5;
+  for (let i = 0; i < bands; i++) {
+    if (c.noise(step, i * 13) > 0.35 + c.I * 0.3) continue;
+    const by = c.noise(step, i * 7) * h;
+    const bh = h * (0.02 + c.noise(step, i * 11) * 0.09);
+    ctx.fillStyle = c1(c, i % 3, 0.18 + c.I * 0.22);
+    ctx.fillRect(0, by, w, bh);
+  }
+
+  // ---- The waveform -------------------------------------------------------
+  // Gain rides the beat and the Intensity control; past 1.0 the signal simply
+  // cannot get louder, it can only get squarer.
+  // Deliberately over unity: the signal is meant to be past the ceiling most of
+  // the time, hardest right after each 16th, so the flat tops come and go in
+  // rhythm instead of sitting there.
+  const gain = (0.8 + c.I * 2.6) * (0.5 + (1 - hit) * 1.6);
+  const ceiling = h * 0.32;
+  const N = 128;
+  const barW = w / N;
+  const seedA = c.rand(1) * 10 + 1;
+  const seedB = c.rand(2) * 7 + 1;
+
+  const sample = (i: number) => {
+    const x = i / N;
+    // A few detuned partials plus per-16th noise: musical, not a sine.
+    const s =
+      Math.sin(x * TAU * seedA + c.beat * 3.1) * 0.55 +
+      Math.sin(x * TAU * seedB * 2.3 - c.beat * 5.7) * 0.3 +
+      (c.noise(step, i) - 0.5) * 0.5 * c.I;
+    return s * gain * ceiling;
+  };
+
+  const drawWave = (g: CanvasRenderingContext2D, dx: number) => {
+    for (let i = 0; i < N; i++) {
+      const v = sample(i);
+      const a = Math.min(Math.abs(v), ceiling);
+      g.fillRect(dx + i * barW, cy - a, barW * 0.86, a * 2);
+    }
+  };
+
+  // RGB split: three inks, three offsets, screened together. On a black ground
+  // the overlaps go white, which is exactly how a blown-out mix looks.
+  const split = w * (0.006 + c.I * 0.022) * (0.3 + (1 - hit));
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  for (let k = 0; k < 3; k++) {
+    ctx.fillStyle = c1(c, k);
+    drawWave(ctx, (k - 1) * split);
+  }
+  ctx.restore();
+
+  // Clipped samples get a peak-red cap at the rail — the "overs" on a meter.
+  // Only the flat top is red; painting the whole bar would bury the waveform.
+  ctx.fillStyle = c1(c, 3);
+  const cap = ceiling * 0.16;
+  let clipped = 0;
+  for (let i = 0; i < N; i++) {
+    if (Math.abs(sample(i)) < ceiling) continue;
+    clipped++;
+    ctx.fillRect(i * barW, cy - ceiling, barW * 0.86, cap);
+    ctx.fillRect(i * barW, cy + ceiling - cap, barW * 0.86, cap);
+  }
+
+  // The ceiling itself, and — once enough of the signal is flat-topped — the
+  // rails light up. No text, just the two lines the waveform is stuck against.
+  const over = clipped / N;
+  ctx.fillStyle = over > 0.25 ? c1(c, 3) : c1(c, 2, 0.55);
+  const railH = Math.max(2, h * (0.004 + over * 0.02));
+  ctx.fillRect(0, cy - ceiling - railH, w, railH);
+  ctx.fillRect(0, cy + ceiling, w, railH);
+
+  // ---- Shapes popping on the 16ths ---------------------------------------
+  // Three stay alive at a time, each scaling down from an overshoot with a hard
+  // black keyline, so the frame is always mid-impact somewhere.
+  for (let k = 0; k < 3; k++) {
+    const s0 = step - k;
+    const age = (sub + k) / 3;
+    if (age >= 1) continue;
+    if (c.noise(s0, 3) > 0.45 + c.I * 0.45) continue;
+    const x = c.noise(s0, 1) * w;
+    const y = c.noise(s0, 2) * h;
+    const size =
+      Math.min(w, h) * (0.08 + c.noise(s0, 4) * 0.16) * (1.6 - easeOutExpo(age) * 0.6);
+    const kind = Math.floor(c.noise(s0, 5) * 4);
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate((c.noise(s0, 6) - 0.5) * 1.2);
+    ctx.globalAlpha = 1 - age * 0.35;
+    ctx.fillStyle = c1(c, Math.floor(c.noise(s0, 7) * 3));
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = size * 0.09;
+    ctx.lineJoin = 'round';
+    if (kind === 0) starPath(ctx, size * 0.5, 4, 0.32);
+    else if (kind === 1) heartPath(ctx, size);
+    else if (kind === 2) {
+      ctx.beginPath();
+      ctx.arc(0, 0, size * 0.42, 0, TAU);
+      ctx.closePath();
+    } else {
+      ctx.beginPath();
+      ctx.rect(-size * 0.4, -size * 0.4, size * 0.8, size * 0.8);
+    }
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+
+  // Datamosh: one horizontal slab of the frame is torn sideways per 16th.
+  if (c.I > 0.3 && c.noise(step, 21) < 0.15 + c.I * 0.45) {
+    const my = c.noise(step, 22) * h * 0.8;
+    const mh = h * (0.04 + c.noise(step, 23) * 0.14);
+    const md = (c.noise(step, 24) - 0.5) * w * 0.3 * c.I;
+    // drawImage from the canvas onto itself stays on the GPU; getImageData here
+    // would force a full readback every frame it fires.
+    ctx.drawImage(ctx.canvas, 0, my, w, mh, md, my, w, mh);
   }
 }
 

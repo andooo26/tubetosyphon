@@ -14,7 +14,8 @@ export type Genre =
   | 'hiphop'
   | 'ambient'
   | 'pop'
-  | 'kawaii';
+  | 'kawaii'
+  | 'hyperpop';
 
 export interface GenParams {
   bpm: number;
@@ -44,6 +45,7 @@ export const GENRES: { value: Genre; label: string; bpm: number }[] = [
   { value: 'ambient', label: 'Ambient', bpm: 70 },
   { value: 'pop', label: 'Pop / EDM', bpm: 128 },
   { value: 'kawaii', label: 'Kawaii', bpm: 150 },
+  { value: 'hyperpop', label: 'Hyperpop / 音割れ', bpm: 165 },
 ];
 
 export const MIN_BPM = 40;
