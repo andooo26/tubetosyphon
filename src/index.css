@@ -119,6 +119,19 @@ body {
   border-right-width: 1px;
 }
 
+/* Right-hand group in the rail: the generative output, which is independent of
+   the player routing and so must stay visible and operable from any view. */
+.vjbar .modes .railgroup {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.vjbar .modes .railgroup .statusline {
+  padding: 0;
+}
+
 .wordmark {
   font-family: var(--mono);
   font-size: 10px;

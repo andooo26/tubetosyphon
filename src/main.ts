@@ -105,7 +105,7 @@ function getChannel(id: unknown): Channel | null {
 // mode the per-channel Syphon servers are stopped; both channels keep capturing
 // (into ch.latest) and a single mixer blends L/R by vjAlpha and publishes to one
 // server. In 'dual' mode each channel publishes to its own server as before.
-type Mode = 'dual' | 'vj' | 'gen';
+type Mode = 'dual' | 'vj';
 let mode: Mode = 'dual';
 let vjAlpha = 0; // 0 = full A (left), 1 = full B (right)
 // Active crossfade animation (Cut A/B fade over a duration instead of jumping).
@@ -740,7 +740,9 @@ function createGenWindow() {
 }
 
 function onGenPaint(image: Electron.NativeImage) {
-  if (mode !== 'gen' || !genSyphon.isRunning) return;
+  // Independent of the player routing: paints publish whenever the generative
+  // server is up.
+  if (!genSyphon.isRunning) return;
   try {
     if (image.isEmpty()) return;
     const size = image.getSize();
@@ -789,14 +791,19 @@ function stopGen() {
 // Switch between 'dual' and 'vj'. Entering VJ stops the per-channel servers,
 // starts the single mixed server, and makes sure both channels are capturing.
 // Leaving VJ tears the mixer down and stops capture (dual outputs start on demand).
+/**
+ * Switch how the two players are routed. This only owns the *player* outputs —
+ * the generative output is independent and is not touched here, so 汎用 can be
+ * publishing its own Syphon server while the players run in either mode
+ * (Dual + 汎用 = three simultaneous sources).
+ */
 function setMode(next: Mode): { ok: boolean; error?: string } {
   if (next === mode) return { ok: true };
 
-  // Tear the previous mode down first — every mode owns its own Syphon
-  // server(s), and only one mode's outputs may be live at a time.
+  // Tear the previous routing down: the per-channel servers and the mixer are
+  // mutually exclusive with each other.
   stopVjTimer();
   vjSyphon.dispose();
-  stopGen();
   for (const ch of Object.values(channels)) {
     stopCapture(ch);
     ch.syphon.dispose();
@@ -809,17 +816,8 @@ function setMode(next: Mode): { ok: boolean; error?: string } {
     mode = 'vj';
     for (const ch of Object.values(channels)) startCapture(ch);
     startVjTimer();
-  } else if (next === 'gen') {
-    // No capture at all in 汎用 mode: the players stay loaded but idle.
-    mode = 'gen';
-    const res = startGen();
-    if (!res.ok) {
-      mode = 'dual';
-      sendStatus({});
-      return res;
-    }
   } else {
-    // Dual: per-channel outputs start on demand via "Start Syphon".
+    // Dual: per-channel outputs start on demand via "Start output".
     mode = 'dual';
   }
   sendStatus({});
@@ -921,7 +919,7 @@ ipcMain.handle(
 ipcMain.handle('app:start-output', (_e, channelId: ChannelId) => {
   const ch = getChannel(channelId);
   if (!ch) return { ok: false, error: 'unknown channel' };
-  if (mode !== 'dual') return { ok: false, error: 'switch to Dual mode first' };
+  if (mode === 'vj') return { ok: false, error: 'switch to Dual mode first' };
   if (!ch.syphon.start()) {
     return { ok: false, error: ch.syphon.error };
   }
@@ -992,10 +990,17 @@ ipcMain.handle(
 );
 
 ipcMain.handle('app:set-mode', (_e, next: Mode) => {
-  if (next !== 'dual' && next !== 'vj' && next !== 'gen') {
-    return { ok: false, error: 'bad mode' };
-  }
+  if (next !== 'dual' && next !== 'vj') return { ok: false, error: 'bad mode' };
   return setMode(next);
+});
+
+// The generative output runs independently of the player routing, so it gets
+// its own start/stop rather than being implied by a mode.
+ipcMain.handle('app:set-gen-output', (_e, on: boolean) => {
+  if (on) return startGen();
+  stopGen();
+  sendStatus({});
+  return { ok: true };
 });
 
 // Update the generative params (partial patch: the UI sends only what changed).

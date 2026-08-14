@@ -426,9 +426,23 @@ function Player({
 
 // VJ crossfade + mode toggle bar. In VJ mode the two players feed one Syphon
 // output ("TubeToSyphon") blended by the A/B fader; Cut A/B jump to either end.
-function VjBar({ status }: { status: AppStatus }) {
+function VjBar({
+  status,
+  view,
+  setView,
+}: {
+  status: AppStatus;
+  view: View;
+  setView: (v: View) => void;
+}) {
   const vjMode = status.mode === 'vj';
   const vj = status.vj;
+  const gen = status.gen;
+
+  const toggleGen = async () => {
+    const res = await window.api.setGenOutput(!gen.running);
+    if (!res.ok && res.error) alert(res.error);
+  };
 
   const setMode = async (mode: Mode) => {
     const res = await window.api.setMode(mode);
@@ -456,21 +470,35 @@ function VjBar({ status }: { status: AppStatus }) {
           >
             VJ
           </button>
-          <button
-            className={status.mode === 'gen' ? 'primary' : ''}
-            onClick={() => setMode('gen')}
-            title="BPM/ジャンル駆動の汎用グラフィックスを出力"
-          >
-            Generative
-          </button>
         </div>
         <span className="wordmark">
-          {status.mode === 'dual'
-            ? '2 outputs'
-            : status.mode === 'vj'
-              ? '1 output · crossfade'
-              : '1 output · 汎用'}
+          {vjMode ? 'players → 1 · crossfade' : 'players → 2'}
         </span>
+
+        {/* The generative output is its own Syphon server, independent of the
+            player routing — Dual + 汎用 publishes three sources at once. So it
+            gets its own group, and stays reachable from either view. */}
+        <div className="railgroup">
+          <button
+            className={view === 'gen' ? 'primary' : ''}
+            onClick={() => setView(view === 'gen' ? 'players' : 'gen')}
+            title="汎用グラフィックスの操作パネルを開閉（出力の入切とは別）"
+          >
+            汎用
+          </button>
+          <button
+            className={gen.running ? 'danger' : ''}
+            onClick={toggleGen}
+            title="汎用グラフィックスを独立したSyphonソースとして出力"
+          >
+            {gen.running ? 'Stop gen' : 'Start gen'}
+          </button>
+          <div className="statusline">
+            <span className={`dot ${gen.running ? 'on' : 'off'}`} />
+            <b>{gen.serverName}</b>
+            {gen.running && <span>· {gen.fps} fps</span>}
+          </div>
+        </div>
       </div>
 
       {vjMode && (
@@ -643,8 +671,12 @@ function GenPanel({ status }: { status: AppStatus }) {
   );
 }
 
+/** Which workspace is on screen. Purely a view — it starts and stops nothing. */
+type View = 'players' | 'gen';
+
 export default function App() {
   const [status, setStatus] = useState<AppStatus>(EMPTY_STATUS);
+  const [view, setView] = useState<View>('players');
 
   useEffect(() => {
     window.api.getStatus().then(setStatus);
@@ -653,15 +685,16 @@ export default function App() {
   }, []);
 
   const vjMode = status.mode === 'vj';
-  const genMode = status.mode === 'gen';
+  const genView = view === 'gen';
 
   return (
     <div className="app">
-      <VjBar status={status} />
-      {genMode && <GenPanel status={status} />}
-      {/* Kept mounted but hidden in 汎用 mode: unmounting would destroy the
-          <webview>s and lose whatever the user had loaded. */}
-      <div className="players" style={genMode ? { display: 'none' } : undefined}>
+      <VjBar status={status} view={view} setView={setView} />
+      {genView && <GenPanel status={status} />}
+      {/* Kept mounted but hidden while the generative panel is up: unmounting
+          would destroy the <webview>s and lose whatever the user had loaded.
+          The players keep publishing to Syphon either way. */}
+      <div className="players" style={genView ? { display: 'none' } : undefined}>
         <Player channel="left" status={status.left} vjMode={vjMode} />
         <div className="divider" />
         <Player channel="right" status={status.right} vjMode={vjMode} />

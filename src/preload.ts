@@ -28,8 +28,12 @@ export interface ChannelStatus {
   quality: Quality;
 }
 
-// 'gen' = 汎用: no video source, a generative sketch driven by BPM + genre.
-export type Mode = 'dual' | 'vj' | 'gen';
+/**
+ * How the two players are routed: two Syphon servers, or one crossfaded server.
+ * The 汎用 (generative) output is NOT a mode — it is an independent third
+ * server that can run alongside either routing.
+ */
+export type Mode = 'dual' | 'vj';
 
 export interface VjStatus {
   running: boolean;
@@ -86,6 +90,8 @@ const api = {
     durationMs: number,
   ): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('app:vj-fade', target, durationMs),
+  setGenOutput: (on: boolean): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('app:set-gen-output', on),
   setGenParams: (
     patch: Partial<GenParams>,
   ): Promise<{ ok: boolean; error?: string }> =>
