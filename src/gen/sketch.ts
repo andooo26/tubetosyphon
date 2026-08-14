@@ -803,31 +803,48 @@ function drawHyperpop(ctx: CanvasRenderingContext2D, w: number, h: number, c: Cl
     const x = c.noise(s0, 1) * w;
     const y = c.noise(s0, 2) * h;
     const size =
-      Math.min(w, h) * (0.08 + c.noise(s0, 4) * 0.16) * (1.6 - easeOutExpo(age) * 0.6);
+      Math.min(w, h) * (0.11 + c.noise(s0, 4) * 0.2) * (1.7 - easeOutExpo(age) * 0.7);
     const kind = Math.floor(c.noise(s0, 5) * 4);
     ctx.save();
     ctx.translate(x, y);
-    ctx.rotate((c.noise(s0, 6) - 0.5) * 1.2);
+    // Angles snap to 45° steps: shapes read as struck rather than scattered.
+    ctx.rotate(Math.floor(c.noise(s0, 6) * 8) * (Math.PI / 4));
     ctx.globalAlpha = 1 - age * 0.35;
     ctx.fillStyle = c1(c, Math.floor(c.noise(s0, 7) * 3));
     ctx.strokeStyle = '#000';
     ctx.lineWidth = size * 0.09;
-    ctx.lineJoin = 'round';
-    if (kind === 0) starPath(ctx, size * 0.5, 4, 0.32);
-    else if (kind === 1) heartPath(ctx, size);
-    else if (kind === 2) {
-      ctx.beginPath();
-      ctx.arc(0, 0, size * 0.42, 0, TAU);
-      ctx.closePath();
-    } else {
-      ctx.beginPath();
-      ctx.rect(-size * 0.4, -size * 0.4, size * 0.8, size * 0.8);
-    }
+    ctx.lineJoin = 'miter';
+    ctx.miterLimit = 8;
+    if (kind === 0) shardPath(ctx, size);
+    else if (kind === 1) boltPath(ctx, size);
+    else if (kind === 2) bladePath(ctx, size);
+    else starPath(ctx, size * 0.55, 4, 0.16); // a spike star, not a sparkle
     ctx.fill();
     ctx.stroke();
     ctx.restore();
   }
   ctx.globalAlpha = 1;
+
+  // Hard diagonal slashes across the frame — the sharpest mark available, and
+  // the one thing that crosses the whole composition.
+  const slashes = 1 + Math.round(c.I * 1.5);
+  for (let i = 0; i < slashes; i++) {
+    if (c.noise(step, 30 + i) > 0.14 + c.I * 0.26) continue;
+    const sx = c.noise(step, 40 + i) * w;
+    const lean = (c.noise(step, 50 + i) - 0.5) * w * 0.55;
+    // Kept thin and tapered: a cut, not a wedge. Wider than this and the slash
+    // starts competing with the waveform for the frame.
+    const tw = w * (0.002 + c.noise(step, 60 + i) * 0.008);
+    const pick = c.noise(step, 70 + i);
+    ctx.fillStyle = pick < 0.45 ? c1(c, 3) : pick < 0.75 ? c1(c, 1) : '#fff';
+    ctx.beginPath();
+    ctx.moveTo(sx, -h * 0.05);
+    ctx.lineTo(sx + tw * 1.6, -h * 0.05);
+    ctx.lineTo(sx + lean + tw, h * 1.05);
+    ctx.lineTo(sx + lean, h * 1.05);
+    ctx.closePath();
+    ctx.fill();
+  }
 
   // Datamosh: one horizontal slab of the frame is torn sideways per 16th.
   if (c.I > 0.3 && c.noise(step, 21) < 0.15 + c.I * 0.45) {
@@ -877,6 +894,48 @@ function starPath(
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
+  ctx.closePath();
+}
+
+/** A long tapered spike, tip up. */
+function shardPath(ctx: CanvasRenderingContext2D, s: number) {
+  ctx.beginPath();
+  ctx.moveTo(0, -s * 0.62);
+  ctx.lineTo(s * 0.2, s * 0.16);
+  ctx.lineTo(0, s * 0.5);
+  ctx.lineTo(-s * 0.2, s * 0.16);
+  ctx.closePath();
+}
+
+/** Lightning bolt. */
+function boltPath(ctx: CanvasRenderingContext2D, s: number) {
+  ctx.beginPath();
+  ctx.moveTo(s * 0.1, -s * 0.55);
+  ctx.lineTo(-s * 0.3, s * 0.08);
+  ctx.lineTo(-s * 0.04, s * 0.08);
+  ctx.lineTo(-s * 0.16, s * 0.55);
+  ctx.lineTo(s * 0.3, -s * 0.1);
+  ctx.lineTo(s * 0.02, -s * 0.1);
+  ctx.closePath();
+}
+
+/** Angular X — two crossed blades. */
+function bladePath(ctx: CanvasRenderingContext2D, s: number) {
+  const a = s * 0.5;
+  const b = s * 0.12;
+  ctx.beginPath();
+  ctx.moveTo(-a, -a + b);
+  ctx.lineTo(-a + b, -a);
+  ctx.lineTo(0, -b);
+  ctx.lineTo(a - b, -a);
+  ctx.lineTo(a, -a + b);
+  ctx.lineTo(b, 0);
+  ctx.lineTo(a, a - b);
+  ctx.lineTo(a - b, a);
+  ctx.lineTo(0, b);
+  ctx.lineTo(-a + b, a);
+  ctx.lineTo(-a, a - b);
+  ctx.lineTo(-b, 0);
   ctx.closePath();
 }
 
