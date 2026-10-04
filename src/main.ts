@@ -1158,7 +1158,31 @@ ipcMain.on('app:projector-frame-done', () => {
   if (projectorFrameDone()) sendStatus({});
 });
 
+// Packaged-build smoke test (used by CI): U2S_SELFTEST=1 starts one output,
+// publishes a single red frame through the platform output (Syphon/Spout),
+// prints the result as JSON and exits — no window is opened.
+function runSelfTest() {
+  const out = createOutput('TubeToSyphon-SelfTest');
+  const started = out.start();
+  const published = started && out.publishRGBA(getRedFrame(), OUT_W, OUT_H);
+  console.log(
+    `U2S_SELFTEST ${JSON.stringify({
+      protocol: OUTPUT_PROTOCOL,
+      packaged: app.isPackaged,
+      started,
+      published,
+      error: out.error,
+    })}`,
+  );
+  out.dispose();
+  app.exit(started && published ? 0 : 1);
+}
+
 app.on('ready', () => {
+  if (process.env.U2S_SELFTEST === '1') {
+    runSelfTest();
+    return;
+  }
   installLoginHeaderFilter();
   createWindow();
   // Keep the display list current, and drop the projector if it is unplugged.

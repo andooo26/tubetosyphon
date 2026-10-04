@@ -132,8 +132,9 @@ the Build Tools and run `npm run build:spout`. Starting an output without the
 addon shows the error in the UI.
 
 Differences from Syphon: Spout cannot tell whether a receiver is connected, so
-the status line omits "connected / no receiver". `.github/workflows/build-spout.yml`
-compiles and smoke-loads the addon on a Windows runner.
+the status line omits "connected / no receiver". `.github/workflows/build-windows.yml`
+builds the Windows app on a Windows runner (Setup.exe installer + portable zip,
+in the run's Artifacts) and smoke-tests Spout in the packaged exe.
 
 ---
 

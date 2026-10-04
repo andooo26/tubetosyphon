@@ -1,0 +1,53 @@
+# Build the Windows app on a Windows runner (the Spout addon needs MSVC, so it
+# cannot be built on macOS):
+#   1. npm ci            -> postinstall compiles native/spout (spout.node)
+#   2. npm run make      -> Squirrel Setup.exe installer + portable zip
+#   3. smoke test        -> the packaged exe publishes one frame via Spout
+# Download the results from the run's "Artifacts" section.
+name: build-windows
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # node-syphon (optional, macOS only) is expected to be skipped here.
+      - run: npm ci
+      # build-spout.js only warns on failure, so assert the output explicitly.
+      - name: Load spout.node
+        run: node -e "const a = require('./native/spout/build/Release/spout.node'); console.log(Object.keys(a))"
+      - run: npm run make
+      - name: List outputs
+        shell: pwsh
+        run: Get-ChildItem -Recurse out/make | Select-Object FullName, Length
+      - name: Smoke test packaged app (Spout)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse out -Filter 'Tube to Syphon.exe' |
+            Where-Object { $_.FullName -notmatch '\\make\\' } |
+            Select-Object -First 1
+          if (-not $exe) { throw 'packaged exe not found' }
+          $env:U2S_SELFTEST = '1'
+          # A GUI-subsystem exe: Start-Process -Wait so we really wait for it.
+          $p = Start-Process -FilePath $exe.FullName -Wait -PassThru `
+            -RedirectStandardOutput selftest.out -RedirectStandardError selftest.err
+          Get-Content selftest.out, selftest.err
+          if (-not (Select-String -Path selftest.out, selftest.err -Pattern 'U2S_SELFTEST' -Quiet)) {
+            throw 'self-test did not report'
+          }
+          if ($p.ExitCode -ne 0) { throw "self-test failed (exit $($p.ExitCode))" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tube-to-syphon-windows-setup
+          path: out/make/squirrel.windows/x64/*.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tube-to-syphon-windows-portable
+          path: out/make/zip/win32/x64/*.zip

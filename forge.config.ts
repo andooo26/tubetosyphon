@@ -34,7 +34,9 @@ const config: ForgeConfig = {
   },
   makers: [
     new MakerSquirrel({}),
-    new MakerZIP({}, ['darwin']),
+    // Windows: portable zip (unzip and run the .exe) next to the Squirrel
+    // Setup.exe installer.
+    new MakerZIP({}, ['darwin', 'win32']),
     new MakerRpm({}),
     new MakerDeb({}),
   ],
