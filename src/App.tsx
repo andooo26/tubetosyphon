@@ -517,8 +517,6 @@ function ProjectorControl({ status }: { status: AppStatus }) {
     if (proj.open) open(id);
   };
 
-  // A / B are captured whenever projected; the VJ mix only exists in VJ mode.
-  const live = proj.source !== 'vj' || status.mode === 'vj';
 
   return (
     <div className="projgroup">
@@ -546,13 +544,8 @@ function ProjectorControl({ status }: { status: AppStatus }) {
           }
         >
           {PROJECTOR_SOURCES.map((o) => (
-            <option
-              key={o.value}
-              value={o.value}
-              disabled={o.value === 'vj' && status.mode !== 'vj'}
-            >
+            <option key={o.value} value={o.value}>
               {o.label}
-              {o.value === 'vj' && status.mode !== 'vj' ? ' (VJ mode)' : ''}
             </option>
           ))}
         </select>
@@ -567,14 +560,9 @@ function ProjectorControl({ status }: { status: AppStatus }) {
       </button>
       {proj.open && (
         <div className="statusline">
-          <span className={`dot ${live ? 'on' : 'off'}`} />
-          {proj.source === 'gen' ? (
-            <span>live</span>
-          ) : live ? (
-            <span>{proj.fps} fps</span>
-          ) : (
-            <span className="warn">no signal</span>
-          )}
+          <span className="dot on" />
+          {/* 汎用 is drawn inside the projector window, so there is no feed to count. */}
+          <span>{proj.source === 'gen' ? 'live' : `${proj.fps} fps`}</span>
         </div>
       )}
     </div>
@@ -660,7 +648,9 @@ function VjBar({
         <LoginControl />
       </div>
 
-      {vjMode && (
+      {/* The fader also drives the projector's VJ mix in Dual mode (the mix is
+          then shown only on the projector, not published). */}
+      {(vjMode || status.projector.source === 'vj') && (
         <div className="vjfade">
           <button onClick={() => fadeTo(0)} title="Fade to A over ~1s">
             Fade→A
@@ -679,12 +669,19 @@ function VjBar({
           <button onClick={() => fadeTo(1)} title="Fade to B over ~1s">
             Fade→B
           </button>
-          <div className="statusline">
-            <span className={`dot ${vj.running ? 'on' : 'off'}`} />
-            <b>{vj.serverName}</b>
-            <span>· {vj.fps} fps</span>
-            <ReceiverState hasClients={vj.hasClients} />
-          </div>
+          {vjMode ? (
+            <div className="statusline">
+              <span className={`dot ${vj.running ? 'on' : 'off'}`} />
+              <b>{vj.serverName}</b>
+              <span>· {vj.fps} fps</span>
+              <ReceiverState hasClients={vj.hasClients} />
+            </div>
+          ) : (
+            <div className="statusline">
+              <span className={`dot ${status.projector.open ? 'on' : 'off'}`} />
+              <b>Projector only</b>
+            </div>
+          )}
         </div>
       )}
       {vjMode && vj.error && (

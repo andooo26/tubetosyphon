@@ -100,8 +100,10 @@ projector window (or **Stop proj**) closes it; unplugging the display closes it
 too.
 
 - Projecting A / B captures that player even if its Syphon/Spout output is
-  not started. The VJ mix exists only in VJ mode (the option is disabled in
-  Dual).
+  not started.
+- **VJ mix** works in either mode, with the A/B fader. In Dual mode the fader
+  row appears while the projector source is VJ mix and drives only the
+  projector — the two Dual outputs stay as they are and no mix is published.
 - Project onto a display other than the one the main window is on: if the
   projector covers the main window, the OS stops painting the players and the
   feed freezes.

@@ -853,15 +853,21 @@ function setMode(next: Mode): { ok: boolean; error?: string } {
  * Run each player's capture exactly when something consumes its frames: its
  * own Syphon/Spout output, the VJ mixer, or the projector showing it. The
  * projector alone is enough, so a player can be projected without publishing.
+ *
+ * Likewise the mixer runs in VJ mode, or in Dual mode while the projector shows
+ * the VJ mix — then the fader drives only the projector (vjSyphon is not
+ * started, so the mix is not published) and both Dual outputs are unaffected.
  */
 function syncCapture() {
   const projected = activeProjectorSource();
+  const mixing = mode === 'vj' || projected === 'vj';
   for (const ch of Object.values(channels)) {
-    const needed =
-      mode === 'vj' || ch.syphon.isRunning || projected === ch.id;
+    const needed = mixing || ch.syphon.isRunning || projected === ch.id;
     if (needed) startCapture(ch);
     else stopCapture(ch);
   }
+  if (mixing) startVjTimer();
+  else stopVjTimer();
 }
 
 function startCapture(ch: Channel) {
