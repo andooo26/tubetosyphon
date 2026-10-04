@@ -3,10 +3,12 @@ import type {
   AppStatus,
   ChannelId,
   ChannelStatus,
+  LoginState,
   Mode,
   Quality,
 } from './preload';
 import { GenCanvas } from './GenView';
+import { PLAYER_PARTITION } from './constants';
 import {
   DEFAULT_GEN_PARAMS,
   GENRES,
@@ -349,7 +351,7 @@ function Player({
       <div className="stage">
         <webview
           ref={webviewRef as React.Ref<HTMLElement>}
-          partition={`persist:player-${channel}`}
+          partition={PLAYER_PARTITION}
           useragent={DESKTOP_UA}
           className="webview"
           {...({ allowpopups: 'true' } as Record<string, string>)}
@@ -426,6 +428,43 @@ function Player({
 
 // VJ crossfade + mode toggle bar. In VJ mode the two players feed one Syphon
 // output ("TubeToSyphon") blended by the A/B fader; Cut A/B jump to either end.
+/**
+ * Google account (for YouTube Premium). Login runs in a separate window on the
+ * shared player session, so both players pick it up.
+ */
+function LoginControl() {
+  const [login, setLogin] = useState<LoginState>({ loggedIn: false });
+
+  useEffect(() => {
+    window.api.getLoginState().then(setLogin);
+    return window.api.onLoginState(setLogin);
+  }, []);
+
+  const toggle = () => {
+    if (login.loggedIn) window.api.googleLogout();
+    else window.api.googleLogin();
+  };
+
+  return (
+    <div className="logingroup">
+      <div className="statusline">
+        <span className={`dot ${login.loggedIn ? 'on' : 'off'}`} />
+        <span>{login.loggedIn ? 'ログイン中' : '未ログイン'}</span>
+      </div>
+      <button
+        onClick={toggle}
+        title={
+          login.loggedIn
+            ? 'YouTube / Google のログイン情報を消去して両プレイヤーを再読み込み'
+            : 'Googleアカウントでログイン（YouTube Premium 用）'
+        }
+      >
+        {login.loggedIn ? 'ログアウト' : 'Googleログイン'}
+      </button>
+    </div>
+  );
+}
+
 function VjBar({
   status,
   view,
@@ -499,6 +538,7 @@ function VjBar({
             {gen.running && <span>· {gen.fps} fps</span>}
           </div>
         </div>
+        <LoginControl />
       </div>
 
       {vjMode && (

@@ -2,6 +2,13 @@ import { app, BrowserWindow, ipcMain, webContents } from 'electron';
 import path from 'node:path';
 import started from 'electron-squirrel-startup';
 import { SyphonManager } from './syphon';
+import {
+  getLoginState,
+  installLoginHeaderFilter,
+  logout,
+  openGoogleLogin,
+  type LoginState,
+} from './login';
 import type { Quality } from './preload';
 import {
   DEFAULT_GEN_PARAMS,
@@ -1043,7 +1050,44 @@ ipcMain.handle('app:vj-fade', (_e, target: number, durationMs: number) => {
 
 ipcMain.handle('app:get-status', () => appStatus());
 
-app.on('ready', createWindow);
+// ---- Google login ---------------------------------------------------------
+
+// Reload both player guests so they pick up the changed session cookies.
+function reloadGuests() {
+  for (const ch of Object.values(channels)) {
+    if (ch.guestContentsId == null) continue;
+    const guest = webContents.fromId(ch.guestContentsId);
+    if (guest && !guest.isDestroyed()) guest.reload();
+  }
+}
+
+function sendLoginState(state: LoginState) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('app:login-state', state);
+  }
+}
+
+ipcMain.handle('app:google-login', () => {
+  openGoogleLogin(mainWindow, (state) => {
+    sendLoginState(state);
+    if (state.loggedIn) reloadGuests();
+  });
+  return { ok: true };
+});
+
+ipcMain.handle('app:google-logout', async () => {
+  const state = await logout();
+  sendLoginState(state);
+  reloadGuests();
+  return state;
+});
+
+ipcMain.handle('app:get-login-state', () => getLoginState());
+
+app.on('ready', () => {
+  installLoginHeaderFilter();
+  createWindow();
+});
 
 app.on('window-all-closed', () => {
   stopVjTimer();

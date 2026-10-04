@@ -128,8 +128,18 @@ body {
   gap: 8px;
 }
 
-.vjbar .modes .railgroup .statusline {
+.vjbar .modes .railgroup .statusline,
+.vjbar .modes .logingroup .statusline {
   padding: 0;
+}
+
+/* Account control, after the generative group at the far right of the rail. */
+.vjbar .modes .logingroup {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 14px;
+  border-left: 1px solid var(--rule);
 }
 
 .wordmark {

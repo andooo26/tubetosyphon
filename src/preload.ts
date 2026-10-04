@@ -1,5 +1,8 @@
 import { contextBridge, ipcRenderer, clipboard } from 'electron';
 import type { GenParams } from './gen/params';
+import type { LoginState } from './login';
+
+export type { LoginState };
 
 export type ChannelId = 'left' | 'right';
 
@@ -113,6 +116,20 @@ const api = {
     };
   },
   readClipboard: (): string => clipboard.readText(),
+  /** Open the dedicated Google login window (shared player session). */
+  googleLogin: (): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke('app:google-login'),
+  googleLogout: (): Promise<LoginState> =>
+    ipcRenderer.invoke('app:google-logout'),
+  getLoginState: (): Promise<LoginState> =>
+    ipcRenderer.invoke('app:get-login-state'),
+  onLoginState: (cb: (s: LoginState) => void): (() => void) => {
+    const listener = (_e: unknown, s: LoginState) => cb(s);
+    ipcRenderer.on('app:login-state', listener);
+    return () => {
+      ipcRenderer.removeListener('app:login-state', listener);
+    };
+  },
 };
 
 contextBridge.exposeInMainWorld('api', api);
