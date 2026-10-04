@@ -2,11 +2,12 @@
   "name": "tube-to-syphon",
   "productName": "Tube to Syphon",
   "version": "0.1.0",
-  "description": "Play a video URL (YouTube etc.) and output it as a Syphon source on macOS",
+  "description": "Play a video URL (YouTube etc.) and output it as a Syphon (macOS) / Spout (Windows) source",
   "main": ".vite/build/main.js",
   "private": true,
   "scripts": {
-    "postinstall": "node scripts/apply-syphon-patch.js",
+    "postinstall": "node scripts/apply-syphon-patch.js && node scripts/build-spout.js",
+    "build:spout": "node scripts/build-spout.js",
     "start": "electron-forge start",
     "package": "electron-forge package",
     "make": "electron-forge make",
@@ -43,8 +44,10 @@
   },
   "dependencies": {
     "electron-squirrel-startup": "^1.0.1",
-    "node-syphon": "^1.5.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
+  },
+  "optionalDependencies": {
+    "node-syphon": "^1.5.0"
   }
 }

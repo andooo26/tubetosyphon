@@ -1,5 +1,6 @@
 // Assemble a minimal node_modules tree containing node-syphon and its full
-// runtime dependency chain, to be shipped as an extraResource.
+// runtime dependency chain (macOS) or the Spout addon (Windows), to be shipped
+// as an extraResource.
 //
 // Why: Electron Forge's Vite plugin does not ship node_modules inside the asar,
 // and npm hoists node-syphon's deps (bindings -> file-uri-to-path) to the
@@ -21,6 +22,22 @@ const PACKAGES = ['node-syphon', 'bindings', 'file-uri-to-path'];
 
 fs.rmSync(path.join(root, 'native-bundle'), { recursive: true, force: true });
 fs.mkdirSync(outModules, { recursive: true });
+
+// Windows: no Syphon. Stage our Spout addon instead, at the path spout.ts
+// loads it from when packaged (Resources/node_modules/spout-addon/spout.node).
+if (process.platform === 'win32') {
+  const addon = path.join(root, 'native', 'spout', 'build', 'Release', 'spout.node');
+  if (!fs.existsSync(addon)) {
+    throw new Error(
+      `[build-native-bundle] missing ${addon} — run \`npm run build:spout\` first`,
+    );
+  }
+  const to = path.join(outModules, 'spout-addon');
+  fs.mkdirSync(to, { recursive: true });
+  fs.copyFileSync(addon, path.join(to, 'spout.node'));
+  console.log('[build-native-bundle] staged spout.node -> native-bundle/node_modules/spout-addon');
+  process.exit(0);
+}
 
 for (const pkg of PACKAGES) {
   const from = path.join(srcModules, pkg);

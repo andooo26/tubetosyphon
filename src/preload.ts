@@ -1,8 +1,27 @@
 import { contextBridge, ipcRenderer, clipboard } from 'electron';
 import type { GenParams } from './gen/params';
 import type { LoginState } from './login';
+import type { OutputProtocol } from './output';
+import type {
+  DisplayInfo,
+  ProjectorSource,
+  ProjectorStatus,
+} from './projector';
 
-export type { LoginState };
+export type {
+  DisplayInfo,
+  LoginState,
+  OutputProtocol,
+  ProjectorSource,
+  ProjectorStatus,
+};
+
+/** One finished RGBA frame for the projector window (A / B / VJ sources). */
+export interface ProjectorFrame {
+  data: Uint8Array;
+  width: number;
+  height: number;
+}
 
 export type ChannelId = 'left' | 'right';
 
@@ -22,7 +41,7 @@ export type Quality =
 export interface ChannelStatus {
   running: boolean;
   capturing: boolean;
-  hasClients: boolean;
+  hasClients: boolean | null; // null = protocol can't tell (Spout)
   fps: number;
   serverName: string;
   error: string | null;
@@ -40,7 +59,7 @@ export type Mode = 'dual' | 'vj';
 
 export interface VjStatus {
   running: boolean;
-  hasClients: boolean;
+  hasClients: boolean | null;
   fps: number;
   serverName: string;
   error: string | null;
@@ -52,6 +71,8 @@ export type GenStatus = VjStatus;
 export interface AppStatus {
   left: ChannelStatus;
   right: ChannelStatus;
+  protocol: OutputProtocol; // Syphon on macOS, Spout on Windows
+  projector: ProjectorStatus;
   mode: Mode;
   vjAlpha: number; // 0 = A (left), 1 = B (right)
   vj: VjStatus;
@@ -130,6 +151,32 @@ const api = {
       ipcRenderer.removeListener('app:login-state', listener);
     };
   },
+  /** Open the fullscreen projector window on a display (moves it if open). */
+  openProjector: (displayId: number): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('app:projector-open', displayId),
+  closeProjector: (): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke('app:projector-close'),
+  setProjectorSource: (
+    source: ProjectorSource,
+  ): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('app:projector-set-source', source),
+  // ---- Used by the projector window itself ----
+  onProjectorSource: (cb: (s: ProjectorSource) => void): (() => void) => {
+    const listener = (_e: unknown, s: ProjectorSource) => cb(s);
+    ipcRenderer.on('app:projector-source', listener);
+    return () => {
+      ipcRenderer.removeListener('app:projector-source', listener);
+    };
+  },
+  onProjectorFrame: (cb: (f: ProjectorFrame) => void): (() => void) => {
+    const listener = (_e: unknown, f: ProjectorFrame) => cb(f);
+    ipcRenderer.on('app:projector-frame', listener);
+    return () => {
+      ipcRenderer.removeListener('app:projector-frame', listener);
+    };
+  },
+  /** Ack: the last frame is drawn, main may send the next one. */
+  projectorFrameDone: (): void => ipcRenderer.send('app:projector-frame-done'),
 };
 
 contextBridge.exposeInMainWorld('api', api);

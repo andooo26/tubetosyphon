@@ -133,6 +133,19 @@ body {
   padding: 0;
 }
 
+/* Projector control: display + source pickers and the project toggle. */
+.vjbar .modes .projgroup {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 14px;
+  border-left: 1px solid var(--rule);
+}
+
+.vjbar .modes .projgroup .statusline {
+  padding: 0;
+}
+
 /* Account control, after the generative group at the far right of the rail. */
 .vjbar .modes .logingroup {
   display: flex;
@@ -603,4 +616,28 @@ input[type='range']:disabled::-webkit-slider-thumb {
   width: 100vw;
   height: 100vh;
   display: block;
+}
+
+/* ---- Projector window ---- */
+
+.projstage {
+  width: 100vw;
+  height: 100vh;
+  background: #000;
+  overflow: hidden;
+  cursor: none;
+}
+
+.projcanvas {
+  width: 100vw;
+  height: 100vh;
+  display: block;
+}
+
+/* Generative source: same 1920x1080 canvas as the output, fitted to the display. */
+.projgen {
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  object-fit: contain;
 }

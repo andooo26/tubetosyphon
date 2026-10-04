@@ -5,6 +5,7 @@ import type {
   ChannelStatus,
   LoginState,
   Mode,
+  ProjectorSource,
   Quality,
 } from './preload';
 import { GenCanvas } from './GenView';
@@ -84,6 +85,14 @@ const QUALITY_OPTIONS: { value: Quality; label: string }[] = [
 const EMPTY_STATUS: AppStatus = {
   left: EMPTY_CHANNEL,
   right: EMPTY_CHANNEL,
+  protocol: 'Syphon',
+  projector: {
+    open: false,
+    displayId: null,
+    source: 'left',
+    fps: 0,
+    displays: [],
+  },
   mode: 'dual',
   vjAlpha: 0,
   vj: {
@@ -120,6 +129,12 @@ interface VideoState {
   vw: number; // current decoded video width
   vh: number; // current decoded video height
   maxH: number; // max available resolution height (from YouTube quality levels)
+}
+
+/** "connected" / "no receiver"; nothing when the protocol can't tell (Spout). */
+function ReceiverState({ hasClients }: { hasClients: boolean | null }) {
+  if (hasClients === null) return null;
+  return <span>· {hasClients ? 'connected' : 'no receiver'}</span>;
 }
 
 function Player({
@@ -341,7 +356,7 @@ function Player({
           {!vjMode && (
             <>
               <span>· {status.fps} fps</span>
-              <span>· {status.hasClients ? 'connected' : 'no receiver'}</span>
+              <ReceiverState hasClients={status.hasClients} />
             </>
           )}
         </div>
@@ -426,8 +441,6 @@ function Player({
   );
 }
 
-// VJ crossfade + mode toggle bar. In VJ mode the two players feed one Syphon
-// output ("TubeToSyphon") blended by the A/B fader; Cut A/B jump to either end.
 /**
  * Google account (for YouTube Premium). Login runs in a separate window on the
  * shared player session, so both players pick it up.
@@ -465,6 +478,111 @@ function LoginControl() {
   );
 }
 
+const PROJECTOR_SOURCES: { value: ProjectorSource; label: string }[] = [
+  { value: 'left', label: 'A' },
+  { value: 'right', label: 'B' },
+  { value: 'vj', label: 'VJ mix' },
+  { value: 'gen', label: '汎用' },
+];
+
+/**
+ * Projector: pick a display and which output to show on it, then open a
+ * fullscreen window there. Shows the same picture as the Syphon/Spout output.
+ */
+function ProjectorControl({ status }: { status: AppStatus }) {
+  const proj = status.projector;
+  const [picked, setPicked] = useState<number | null>(null);
+
+  // Default to a non-primary display (the projector is rarely the main screen),
+  // and fall back if the picked one disappears.
+  const displays = proj.displays;
+  const fallback =
+    displays.find((d) => !d.primary)?.id ?? displays[0]?.id ?? null;
+  const displayId =
+    proj.open && proj.displayId != null
+      ? proj.displayId
+      : picked != null && displays.some((d) => d.id === picked)
+        ? picked
+        : fallback;
+
+  const open = async (id: number | null) => {
+    if (id == null) return;
+    const res = await window.api.openProjector(id);
+    if (!res.ok && res.error) alert(res.error);
+  };
+
+  const changeDisplay = (id: number) => {
+    setPicked(id);
+    // Already projecting: move the window to the new display right away.
+    if (proj.open) open(id);
+  };
+
+  // A / B are captured whenever projected; the VJ mix only exists in VJ mode.
+  const live = proj.source !== 'vj' || status.mode === 'vj';
+
+  return (
+    <div className="projgroup">
+      <label className="quality">
+        Projector
+        <select
+          value={displayId ?? ''}
+          onChange={(e) => changeDisplay(Number(e.target.value))}
+          disabled={displays.length === 0}
+        >
+          {displays.map((d) => (
+            <option key={d.id} value={d.id}>
+              {d.label} · {d.width}×{d.height}
+              {d.primary ? ' (main)' : ''}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="quality">
+        Source
+        <select
+          value={proj.source}
+          onChange={(e) =>
+            window.api.setProjectorSource(e.target.value as ProjectorSource)
+          }
+        >
+          {PROJECTOR_SOURCES.map((o) => (
+            <option
+              key={o.value}
+              value={o.value}
+              disabled={o.value === 'vj' && status.mode !== 'vj'}
+            >
+              {o.label}
+              {o.value === 'vj' && status.mode !== 'vj' ? ' (VJ mode)' : ''}
+            </option>
+          ))}
+        </select>
+      </label>
+      <button
+        className={proj.open ? 'danger' : ''}
+        onClick={() => (proj.open ? window.api.closeProjector() : open(displayId))}
+        disabled={!proj.open && displayId == null}
+        title="選んだディスプレイに全画面で出力（投影ウィンドウで Esc でも閉じる）"
+      >
+        {proj.open ? 'Stop proj' : 'Project'}
+      </button>
+      {proj.open && (
+        <div className="statusline">
+          <span className={`dot ${live ? 'on' : 'off'}`} />
+          {proj.source === 'gen' ? (
+            <span>live</span>
+          ) : live ? (
+            <span>{proj.fps} fps</span>
+          ) : (
+            <span className="warn">no signal</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// VJ crossfade + mode toggle bar. In VJ mode the two players feed one Syphon
+// output ("TubeToSyphon") blended by the A/B fader; Cut A/B jump to either end.
 function VjBar({
   status,
   view,
@@ -498,7 +616,7 @@ function VjBar({
           <button
             className={status.mode === 'dual' ? 'primary' : ''}
             onClick={() => setMode('dual')}
-            title="2つのプレイヤーを2系統のSyphonへ"
+            title={`2つのプレイヤーを2系統の${status.protocol}へ`}
           >
             Dual
           </button>
@@ -528,7 +646,7 @@ function VjBar({
           <button
             className={gen.running ? 'danger' : ''}
             onClick={toggleGen}
-            title="汎用グラフィックスを独立したSyphonソースとして出力"
+            title={`汎用グラフィックスを独立した${status.protocol}ソースとして出力`}
           >
             {gen.running ? 'Stop gen' : 'Start gen'}
           </button>
@@ -538,6 +656,7 @@ function VjBar({
             {gen.running && <span>· {gen.fps} fps</span>}
           </div>
         </div>
+        <ProjectorControl status={status} />
         <LoginControl />
       </div>
 
@@ -564,7 +683,7 @@ function VjBar({
             <span className={`dot ${vj.running ? 'on' : 'off'}`} />
             <b>{vj.serverName}</b>
             <span>· {vj.fps} fps</span>
-            <span>· {vj.hasClients ? 'connected' : 'no receiver'}</span>
+            <ReceiverState hasClients={vj.hasClients} />
           </div>
         </div>
       )}
@@ -695,7 +814,7 @@ function GenPanel({ status }: { status: AppStatus }) {
           <span className={`dot ${gen.running ? 'on' : 'off'}`} />
           <b>{gen.serverName}</b>
           <span>· {gen.fps} fps</span>
-          <span>· {gen.hasClients ? 'connected' : 'no receiver'}</span>
+          <ReceiverState hasClients={gen.hasClients} />
           <span>· 1920×1080</span>
         </div>
         {gen.error && <div className="statusline error">{gen.error}</div>}
@@ -705,7 +824,7 @@ function GenPanel({ status }: { status: AppStatus }) {
         {/* 720p backing store: the preview is displayed large, and at 640×360 the
             type and hairlines in the sketch visibly softened when scaled up. */}
         <GenCanvas params={p} width={1280} height={720} className="genthumb" />
-        <div className="genhint">Live preview · identical to the Syphon output</div>
+        <div className="genhint">Live preview · identical to the {status.protocol} output</div>
       </div>
     </div>
   );

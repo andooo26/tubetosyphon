@@ -1,7 +1,7 @@
-import { app, BrowserWindow, ipcMain, webContents } from 'electron';
+import { app, BrowserWindow, ipcMain, screen, webContents } from 'electron';
 import path from 'node:path';
 import started from 'electron-squirrel-startup';
-import { SyphonManager } from './syphon';
+import { OUTPUT_PROTOCOL, createOutput, type FrameOutput } from './output';
 import {
   getLoginState,
   installLoginHeaderFilter,
@@ -9,6 +9,18 @@ import {
   openGoogleLogin,
   type LoginState,
 } from './login';
+import {
+  activeProjectorSource,
+  closeProjector,
+  handleDisplayRemoved,
+  openProjector,
+  projectFrame,
+  projectorFrameDone,
+  projectorStatus,
+  sendToProjector,
+  setProjectorSource,
+  type ProjectorSource,
+} from './projector';
 import type { Quality } from './preload';
 import {
   DEFAULT_GEN_PARAMS,
@@ -37,7 +49,7 @@ type ChannelId = 'left' | 'right';
 interface Channel {
   readonly id: ChannelId;
   readonly serverName: string;
-  readonly syphon: SyphonManager;
+  readonly syphon: FrameOutput; // Syphon (macOS) / Spout (Windows)
   guestContentsId: number | null;
   onWatchPage: boolean; // capture real video? false only on a YouTube browse page (-> black).
   isYouTube: boolean; // current guest page is YouTube (video fills the viewport via our CSS).
@@ -74,7 +86,7 @@ function makeChannel(id: ChannelId, serverName: string): Channel {
   return {
     id,
     serverName,
-    syphon: new SyphonManager(serverName),
+    syphon: createOutput(serverName),
     guestContentsId: null,
     onWatchPage: false,
     isYouTube: false,
@@ -117,7 +129,7 @@ let mode: Mode = 'dual';
 let vjAlpha = 0; // 0 = full A (left), 1 = full B (right)
 // Active crossfade animation (Cut A/B fade over a duration instead of jumping).
 let vjAnim: { from: number; to: number; start: number; dur: number } | null = null;
-const vjSyphon = new SyphonManager('TubeToSyphon');
+const vjSyphon = createOutput('TubeToSyphon');
 let vjTimer: NodeJS.Timeout | null = null;
 let vjBuf: Uint8Array | null = null; // OUT_W*OUT_H*4 RGBA blend scratch
 let vjFramesThisSecond = 0;
@@ -133,7 +145,7 @@ let mainWindow: BrowserWindow | null = null;
 // ?gen=1) driven by BPM + genre, and every painted frame is published to a
 // single Syphon server. Offscreen rendering hands us the finished 1920x1080
 // BGRA bitmap directly, so there is no crop/letterbox step here.
-const genSyphon = new SyphonManager('TubeToSyphon-GEN');
+const genSyphon = createOutput('TubeToSyphon-GEN');
 let genWindow: BrowserWindow | null = null;
 let genParams: GenParams = { ...DEFAULT_GEN_PARAMS, beatEpoch: Date.now() };
 let genFramesThisSecond = 0;
@@ -388,11 +400,13 @@ const createWindow = () => {
     },
   });
 
-  // The hidden generative window is a BrowserWindow too, so it would keep
-  // 'window-all-closed' from ever firing; tear it down with the UI.
+  // The hidden generative window and the projector are BrowserWindows too, so
+  // they would keep 'window-all-closed' from ever firing; tear them down with
+  // the UI.
   mainWindow.on('closed', () => {
     mainWindow = null;
     stopGen();
+    closeProjector();
   });
 
   loadRenderer(mainWindow);
@@ -429,6 +443,7 @@ function getRedFrame(): Uint8Array {
 // as ch.latest for the mixer (which publishes the blended result to one server).
 function outputChannelFrame(ch: Channel, frame: Uint8Array) {
   ch.latest = frame;
+  projectFrame(ch.id, frame, OUT_W, OUT_H);
   if (mode === 'dual') {
     if (ch.syphon.publishRGBA(frame, OUT_W, OUT_H)) countFrame(ch);
   }
@@ -674,6 +689,7 @@ function vjTick() {
     out = vjBuf;
   }
   if (vjSyphon.publishRGBA(out, OUT_W, OUT_H)) countVjFrame();
+  projectFrame('vj', out, OUT_W, OUT_H);
 }
 
 function startVjTimer() {
@@ -708,6 +724,7 @@ function countGenFrame() {
 // so its preview draws exactly the same thing).
 function pushGenParams() {
   genWindow?.webContents.send('app:gen-params', genParams);
+  sendToProjector('app:gen-params', genParams);
 }
 
 function createGenWindow() {
@@ -826,9 +843,25 @@ function setMode(next: Mode): { ok: boolean; error?: string } {
   } else {
     // Dual: per-channel outputs start on demand via "Start output".
     mode = 'dual';
+    syncCapture(); // ...but a projected player keeps capturing
   }
   sendStatus({});
   return { ok: true };
+}
+
+/**
+ * Run each player's capture exactly when something consumes its frames: its
+ * own Syphon/Spout output, the VJ mixer, or the projector showing it. The
+ * projector alone is enough, so a player can be projected without publishing.
+ */
+function syncCapture() {
+  const projected = activeProjectorSource();
+  for (const ch of Object.values(channels)) {
+    const needed =
+      mode === 'vj' || ch.syphon.isRunning || projected === ch.id;
+    if (needed) startCapture(ch);
+    else stopCapture(ch);
+  }
 }
 
 function startCapture(ch: Channel) {
@@ -870,6 +903,8 @@ function appStatus() {
   return {
     left: channelStatus(channels.left),
     right: channelStatus(channels.right),
+    protocol: OUTPUT_PROTOCOL,
+    projector: projectorStatus(),
     mode,
     vjAlpha,
     vj: {
@@ -938,8 +973,8 @@ ipcMain.handle('app:start-output', (_e, channelId: ChannelId) => {
 ipcMain.handle('app:stop-output', (_e, channelId: ChannelId) => {
   const ch = getChannel(channelId);
   if (!ch) return { ok: false, error: 'unknown channel' };
-  stopCapture(ch);
   ch.syphon.dispose();
+  syncCapture(); // keeps capturing if the projector still shows this player
   sendStatus({});
   return { ok: true };
 });
@@ -1084,9 +1119,49 @@ ipcMain.handle('app:google-logout', async () => {
 
 ipcMain.handle('app:get-login-state', () => getLoginState());
 
+// ---- Projector --------------------------------------------------------------
+
+ipcMain.handle('app:projector-open', (_e, displayId: number) => {
+  const res = openProjector(displayId, loadRenderer, () => {
+    syncCapture();
+    sendStatus({});
+  });
+  syncCapture();
+  sendStatus({});
+  return res;
+});
+
+ipcMain.handle('app:projector-close', () => {
+  closeProjector();
+  syncCapture();
+  sendStatus({});
+  return { ok: true };
+});
+
+ipcMain.handle('app:projector-set-source', (_e, next: ProjectorSource) => {
+  if (!['left', 'right', 'vj', 'gen'].includes(next)) {
+    return { ok: false, error: 'bad source' };
+  }
+  setProjectorSource(next);
+  syncCapture();
+  sendStatus({});
+  return { ok: true };
+});
+
+ipcMain.on('app:projector-frame-done', () => {
+  if (projectorFrameDone()) sendStatus({});
+});
+
 app.on('ready', () => {
   installLoginHeaderFilter();
   createWindow();
+  // Keep the display list current, and drop the projector if it is unplugged.
+  screen.on('display-added', () => sendStatus({}));
+  screen.on('display-removed', (_e, d) => {
+    handleDisplayRemoved(d.id);
+    syncCapture();
+    sendStatus({});
+  });
 });
 
 app.on('window-all-closed', () => {

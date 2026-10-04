@@ -24,6 +24,9 @@ const dest = path.join(
   'syphon.node',
 );
 
+// Syphon is macOS-only (Windows uses the Spout addon, see build-spout.js).
+if (process.platform !== 'darwin') process.exit(0);
+
 if (!fs.existsSync(src)) {
   console.warn(`[apply-syphon-patch] vendored binary missing: ${src} — skipping`);
   process.exit(0);

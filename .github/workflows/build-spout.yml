@@ -1,0 +1,31 @@
+# Compile the Windows Spout addon (native/spout) on a Windows runner, since it
+# cannot be built on macOS. Also smoke-loads it to catch link/export errors.
+name: build-spout
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'native/spout/**'
+      - 'vendor/spout2/**'
+      - 'scripts/build-spout.js'
+      - '.github/workflows/build-spout.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # postinstall runs scripts/build-spout.js; node-syphon (optional, macOS
+      # only) is expected to be skipped here.
+      - run: npm ci
+      # build-spout.js only warns on failure, so assert the output explicitly.
+      - name: Load spout.node
+        run: node -e "const a = require('./native/spout/build/Release/spout.node'); console.log(Object.keys(a))"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spout-node-win32-x64
+          path: native/spout/build/Release/spout.node

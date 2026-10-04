@@ -22,8 +22,9 @@ const config: ForgeConfig = {
   },
   rebuildConfig: {},
   hooks: {
-    // Stage node-syphon + its runtime deps into native-bundle/node_modules
-    // right before packaging, so extraResource picks up a fresh copy.
+    // Stage node-syphon + its runtime deps (macOS) or the Spout addon
+    // (Windows) into native-bundle/node_modules right before packaging, so
+    // extraResource picks up a fresh copy.
     prePackage: async () => {
       const { execFileSync } = await import('node:child_process');
       execFileSync(process.execPath, ['scripts/build-native-bundle.js'], {
