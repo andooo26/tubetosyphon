@@ -63,6 +63,8 @@ const EMPTY_CHANNEL: ChannelStatus = {
   capturing: false,
   hasClients: false,
   fps: 0,
+  captureFps: 0,
+  frameMs: 0,
   serverName: '',
   error: null,
   testFrame: false,
@@ -355,7 +357,11 @@ function Player({
           )}
           {!vjMode && (
             <>
-              <span>· {status.fps} fps</span>
+              <span
+                title={`capture ${status.captureFps}/s · ${status.frameMs} ms/frame`}
+              >
+                · {status.fps} fps
+              </span>
               <ReceiverState hasClients={status.hasClients} />
             </>
           )}

@@ -43,6 +43,8 @@ export interface ChannelStatus {
   capturing: boolean;
   hasClients: boolean | null; // null = protocol can't tell (Spout)
   fps: number;
+  captureFps: number; // frames delivered by the page capture per second
+  frameMs: number; // avg main-thread ms to process one captured frame
   serverName: string;
   error: string | null;
   testFrame: boolean;

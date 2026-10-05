@@ -33,6 +33,19 @@ if (started) {
   app.quit();
 }
 
+// Windows: Chromium presents <video> through DirectComposition hardware
+// overlays, which bypass the compositor frame that beginFrameSubscription
+// captures — the video plays smoothly on screen, but the capture only gets a
+// new frame when something *else* on the page repaints (a few per second).
+// Compositing video normally keeps every video frame capturable.
+// U2S_KEEP_VIDEO_OVERLAYS=1 skips this (to A/B the effect).
+if (
+  process.platform === 'win32' &&
+  process.env.U2S_KEEP_VIDEO_OVERLAYS !== '1'
+) {
+  app.commandLine.appendSwitch('disable-direct-composition-video-overlays');
+}
+
 // ---- Output constants (spec: 1080p fixed, ~60fps) -------------------------
 const OUT_W = 1920;
 const OUT_H = 1080;
@@ -76,6 +89,13 @@ interface Channel {
   framesThisSecond: number;
   lastFpsStamp: number;
   measuredFps: number;
+  // Capture diagnostics (shown in the fps tooltip): frames the subscription
+  // delivered per second, and the average onFrame processing time.
+  capThisSecond: number;
+  capMsThisSecond: number;
+  capStamp: number;
+  captureFps: number;
+  frameMs: number;
   frameBuf: Uint8Array | null; // reused OUT_W*OUT_H*4 RGBA letterbox canvas (grown never shrunk)
   lbW: number; // last letterboxed video width (to know when black bars must be re-cleared)
   lbH: number; // last letterboxed video height
@@ -103,6 +123,11 @@ function makeChannel(id: ChannelId, serverName: string): Channel {
     framesThisSecond: 0,
     lastFpsStamp: Date.now(),
     measuredFps: 0,
+    capThisSecond: 0,
+    capMsThisSecond: 0,
+    capStamp: Date.now(),
+    captureFps: 0,
+    frameMs: 0,
     frameBuf: null,
     lbW: -1,
     lbH: -1,
@@ -505,6 +530,7 @@ function onFrame(ch: Channel, image: Electron.NativeImage) {
   // Static modes (test pattern / browsing) are driven by the slow timer so they
   // work even when the page isn't painting; ignore live paints for them.
   if (ch.testFrame || !ch.onWatchPage) return;
+  const t0 = performance.now();
   try {
     if (image.isEmpty()) return;
 
@@ -554,6 +580,25 @@ function onFrame(ch: Channel, image: Electron.NativeImage) {
     outputChannelFrame(ch, frame);
   } catch (err) {
     sendStatus({ error: err instanceof Error ? err.message : String(err) });
+  } finally {
+    countCapture(ch, performance.now() - t0);
+  }
+}
+
+// Per-second capture diagnostics: how many frames the subscription delivered
+// and how long the main thread spent on each (crop/resize/letterbox/publish).
+// A low captureFps with a small frameMs means frames are not arriving; a high
+// frameMs means the processing itself is the bottleneck.
+function countCapture(ch: Channel, ms: number) {
+  ch.capThisSecond++;
+  ch.capMsThisSecond += ms;
+  const now = Date.now();
+  if (now - ch.capStamp >= 1000) {
+    ch.captureFps = ch.capThisSecond;
+    ch.frameMs = ch.capThisSecond ? ch.capMsThisSecond / ch.capThisSecond : 0;
+    ch.capThisSecond = 0;
+    ch.capMsThisSecond = 0;
+    ch.capStamp = now;
   }
 }
 
@@ -897,6 +942,9 @@ function channelStatus(ch: Channel) {
     capturing: ch.captureTimer !== null,
     hasClients: ch.syphon.hasClients,
     fps: ch.measuredFps,
+    // Stale when frames stop arriving: report 0 instead of the last figures.
+    captureFps: Date.now() - ch.capStamp > 2000 ? 0 : ch.captureFps,
+    frameMs: Date.now() - ch.capStamp > 2000 ? 0 : Math.round(ch.frameMs * 10) / 10,
     serverName: ch.serverName,
     error: ch.syphon.error,
     testFrame: ch.testFrame,
