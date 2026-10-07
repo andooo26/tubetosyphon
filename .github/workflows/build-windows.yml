@@ -43,6 +43,25 @@ jobs:
             throw 'self-test did not report'
           }
           if ($p.ExitCode -ne 0) { throw "self-test failed (exit $($p.ExitCode))" }
+      # Reproduce "VJ mode + projector" and record per-stage main-thread cost
+      # (see src/bench.ts). The summary is emitted as a notice annotation so it
+      # is readable from the run page without downloading logs.
+      - name: Benchmark VJ + projector
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $exe = Get-ChildItem -Recurse out -Filter 'Tube to Syphon.exe' |
+            Where-Object { $_.FullName -notmatch '\\make\\' } |
+            Select-Object -First 1
+          $env:U2S_SELFTEST = ''
+          $env:U2S_BENCH = 'vjproj'
+          $env:U2S_BENCH_SECONDS = '20'
+          $p = Start-Process -FilePath $exe.FullName -Wait -PassThru `
+            -RedirectStandardOutput bench.out -RedirectStandardError bench.err
+          Get-Content bench.out, bench.err | Select-String 'U2S_BENCH' | ForEach-Object {
+            $line = $_.Line -replace '^.*U2S_BENCH ', ''
+            Write-Output "::notice title=bench::$line"
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: tube-to-syphon-windows-setup

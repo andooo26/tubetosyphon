@@ -9,6 +9,8 @@ import {
   openGoogleLogin,
   type LoginState,
 } from './login';
+import { perfAdd, startPerf } from './perf';
+import { runBench } from './bench';
 import {
   activeProjectorSource,
   closeProjector,
@@ -44,6 +46,13 @@ if (
   process.env.U2S_KEEP_VIDEO_OVERLAYS !== '1'
 ) {
   app.commandLine.appendSwitch('disable-direct-composition-video-overlays');
+}
+
+// Benchmark on a single-display machine (CI): the fullscreen projector covers
+// the main window, and Windows' native occlusion tracking would then stop the
+// players from painting. Keep them painting so the scenario stays realistic.
+if (process.env.U2S_BENCH && process.platform === 'win32') {
+  app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 }
 
 // ---- Output constants (spec: 1080p fixed, ~60fps) -------------------------
@@ -470,7 +479,9 @@ function outputChannelFrame(ch: Channel, frame: Uint8Array) {
   ch.latest = frame;
   projectFrame(ch.id, frame, OUT_W, OUT_H);
   if (mode === 'dual') {
+    const t = performance.now();
     if (ch.syphon.publishRGBA(frame, OUT_W, OUT_H)) countFrame(ch);
+    perfAdd(`${ch.id}.publish`, performance.now() - t);
   }
 }
 
@@ -565,6 +576,7 @@ function onFrame(ch: Channel, image: Electron.NativeImage) {
     // toBitmap() returns BGRA. Force scaleFactor 1.0 so the buffer is exactly
     // dw*dh px regardless of the display's Retina scale factor.
     const bgra = resized.toBitmap({ scaleFactor: 1.0 });
+    perfAdd(`${ch.id}.native`, performance.now() - t0); // crop+resize+toBitmap
     // Guard against a scaleFactor slip: derive the true pixel size from length.
     const px = bgra.length / 4;
     let bw = dw;
@@ -576,7 +588,9 @@ function onFrame(ch: Channel, image: Electron.NativeImage) {
         bh = dh * k;
       }
     }
+    const tl = performance.now();
     const frame = letterbox(ch, bgra, bw, bh);
+    perfAdd(`${ch.id}.letterbox`, performance.now() - tl);
     outputChannelFrame(ch, frame);
   } catch (err) {
     sendStatus({ error: err instanceof Error ? err.message : String(err) });
@@ -590,6 +604,7 @@ function onFrame(ch: Channel, image: Electron.NativeImage) {
 // A low captureFps with a small frameMs means frames are not arriving; a high
 // frameMs means the processing itself is the bottleneck.
 function countCapture(ch: Channel, ms: number) {
+  perfAdd(`${ch.id}.frame`, ms);
   ch.capThisSecond++;
   ch.capMsThisSecond += ms;
   const now = Date.now();
@@ -718,6 +733,7 @@ function vjTick() {
     sendStatus({}); // keep the UI fader in sync during the fade
   }
 
+  const tTick = performance.now();
   const black = getBlackFrame();
   const L = channels.left.latest ?? black;
   const R = channels.right.latest ?? black;
@@ -730,11 +746,16 @@ function vjTick() {
     if (!vjBuf || vjBuf.length < OUT_W * OUT_H * 4) {
       vjBuf = new Uint8Array(OUT_W * OUT_H * 4);
     }
+    const tb = performance.now();
     blend(vjBuf, L, R, vjAlpha);
+    perfAdd('vj.blend', performance.now() - tb);
     out = vjBuf;
   }
+  const tp = performance.now();
   if (vjSyphon.publishRGBA(out, OUT_W, OUT_H)) countVjFrame();
+  perfAdd('vj.publish', performance.now() - tp);
   projectFrame('vj', out, OUT_W, OUT_H);
+  perfAdd('vj.tick', performance.now() - tTick);
 }
 
 function startVjTimer() {
@@ -833,7 +854,9 @@ function onGenPaint(image: Electron.NativeImage) {
       }
     }
     if (w <= 0 || h <= 0 || bgra.length < w * h * 4) return;
+    const tg = performance.now();
     if (genSyphon.publishBGRA(bgra, w, h)) countGenFrame();
+    perfAdd('gen.publish', performance.now() - tg);
   } catch (err) {
     sendStatus({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -1233,6 +1256,13 @@ app.on('ready', () => {
   }
   installLoginHeaderFilter();
   createWindow();
+  startPerf(); // no-op unless U2S_PERF=1
+  if (process.env.U2S_BENCH === 'vjproj' && mainWindow) {
+    runBench(mainWindow).catch((err) => {
+      console.error('U2S_BENCH failed', err);
+      app.exit(1);
+    });
+  }
   // Keep the display list current, and drop the projector if it is unplugged.
   screen.on('display-added', () => sendStatus({}));
   screen.on('display-removed', (_e, d) => {

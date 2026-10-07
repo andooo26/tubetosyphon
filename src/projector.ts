@@ -1,5 +1,6 @@
 import { BrowserWindow, screen } from 'electron';
 import path from 'node:path';
+import { perfAdd } from './perf';
 
 // ---- Projector output -----------------------------------------------------
 // A frameless fullscreen window on a chosen display (projector) that shows one
@@ -167,11 +168,13 @@ export function projectFrame(
   inFlight = true;
   inFlightSince = now;
   // send() serialises (copies) synchronously, so the caller may reuse rgba.
+  const t = performance.now();
   win.webContents.send('app:projector-frame', {
     data: rgba.subarray(0, width * height * 4),
     width,
     height,
   });
+  perfAdd('proj.send', performance.now() - t);
 }
 
 /** The window finished drawing the last frame. Returns true once per second
