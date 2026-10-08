@@ -1,8 +1,8 @@
-# Build the Windows app on a Windows runner (the Spout addon needs MSVC, so it
-# cannot be built on macOS):
-#   1. npm ci            -> postinstall compiles native/spout (spout.node)
+# Build the Windows app on a Windows runner:
+#   1. npm ci
 #   2. npm run make      -> Squirrel Setup.exe installer + portable zip
-#   3. smoke test        -> the packaged exe publishes one frame via Spout
+#   3. smoke test        -> the packaged exe boots and can issue tab-capture ids
+#   4. benchmark         -> both decks + projector, main-thread lag / CPU / fps
 # Download the results from the run's "Artifacts" section.
 name: build-windows
 
@@ -18,16 +18,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      # node-syphon (optional, macOS only) is expected to be skipped here.
       - run: npm ci
-      # build-spout.js only warns on failure, so assert the output explicitly.
-      - name: Load spout.node
-        run: node -e "const a = require('./native/spout/build/Release/spout.node'); console.log(Object.keys(a))"
+      - run: npx tsc --noEmit
       - run: npm run make
       - name: List outputs
         shell: pwsh
         run: Get-ChildItem -Recurse out/make | Select-Object FullName, Length
-      - name: Smoke test packaged app (Spout)
+      - name: Smoke test packaged app
         shell: pwsh
         run: |
           $exe = Get-ChildItem -Recurse out -Filter 'Tube to Syphon.exe' |
@@ -43,9 +40,10 @@ jobs:
             throw 'self-test did not report'
           }
           if ($p.ExitCode -ne 0) { throw "self-test failed (exit $($p.ExitCode))" }
-      # Reproduce "VJ mode + projector" and record per-stage main-thread cost
-      # (see src/bench.ts). The summary is emitted as a notice annotation so it
-      # is readable from the run page without downloading logs.
+      # Reproduce "both decks + projector" and record main-thread lag, CPU per
+      # process and the projector's per-deck fps (see src/bench.ts). The
+      # summary is emitted as a notice annotation so it is readable from the
+      # run page without downloading logs.
       - name: Benchmark VJ + projector
         shell: pwsh
         continue-on-error: true

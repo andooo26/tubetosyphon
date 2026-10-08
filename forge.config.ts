@@ -5,33 +5,14 @@ import { MakerDeb } from '@electron-forge/maker-deb';
 import { MakerRpm } from '@electron-forge/maker-rpm';
 import { VitePlugin } from '@electron-forge/plugin-vite';
 import { FusesPlugin } from '@electron-forge/plugin-fuses';
-import { AutoUnpackNativesPlugin } from '@electron-forge/plugin-auto-unpack-natives';
 import { FuseV1Options, FuseVersion } from '@electron/fuses';
 
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
-    // The Vite plugin bundles main.js but does NOT ship node_modules in the
-    // asar. node-syphon is a native addon required at runtime, so ship it plus
-    // its dependency chain (bindings -> file-uri-to-path) as a real
-    // node_modules tree under Contents/Resources/node_modules. The
-    // prePackage hook (below) assembles native-bundle/node_modules first.
-    // syphon.ts requires node-syphon from process.resourcesPath/node_modules
-    // when packaged.
-    extraResource: ['./native-bundle/node_modules'],
+    // No native addons: the output is the app's own projector window.
   },
   rebuildConfig: {},
-  hooks: {
-    // Stage node-syphon + its runtime deps (macOS) or the Spout addon
-    // (Windows) into native-bundle/node_modules right before packaging, so
-    // extraResource picks up a fresh copy.
-    prePackage: async () => {
-      const { execFileSync } = await import('node:child_process');
-      execFileSync(process.execPath, ['scripts/build-native-bundle.js'], {
-        stdio: 'inherit',
-      });
-    },
-  },
   makers: [
     new MakerSquirrel({}),
     // Windows: portable zip (unzip and run the .exe) next to the Squirrel
@@ -41,8 +22,6 @@ const config: ForgeConfig = {
     new MakerDeb({}),
   ],
   plugins: [
-    // Unpack native .node addons (node-syphon) out of the asar so they load.
-    new AutoUnpackNativesPlugin({}),
     new VitePlugin({
       // `build` can specify multiple entry builds, which can be Main process, Preload scripts, Worker process, etc.
       // If you are familiar with Vite configuration, it will look really familiar.
