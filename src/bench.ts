@@ -8,7 +8,10 @@ import type { ProjectorStats } from './shared';
 // the fader mid-way (worst case: both decks on screen), and the projector
 // on a secondary display (or the primary one if there is no other). It runs
 // for U2S_BENCH_SECONDS (default 20), prints a summary line and exits.
-// Optional: U2S_BENCH_ALPHA (default 0.5), U2S_BENCH_PROJECTOR=0 to skip it.
+// Optional: U2S_BENCH_ALPHA (default 0.5), U2S_BENCH_PROJECTOR=0 to skip it,
+// U2S_BENCH_URLS="<A url> <B url>" to load real pages (e.g. YouTube watch
+// URLs) instead of the synthetic one, U2S_BENCH_SHOT=<dir> to save PNGs of the
+// projector and the control window at the end (to eyeball crop and mix).
 
 // A page that repaints its whole viewport every animation frame.
 const TEST_PAGE =
@@ -47,9 +50,13 @@ export async function runBench(win: BrowserWindow): Promise<void> {
   await new Promise((r) => setTimeout(r, 1500));
 
   // Drive the real UI through its own preload API, exactly as a user would.
+  const urls = (process.env.U2S_BENCH_URLS ?? '').split(/\s+/).filter(Boolean);
+  const pages = urls.length ? urls : [TEST_PAGE];
   const script = `(async () => {
-    const page = ${JSON.stringify(TEST_PAGE)};
+    const pages = ${JSON.stringify(pages)};
+    let i = 0;
     for (const wv of document.querySelectorAll('webview')) {
+      const page = pages[i++ % pages.length];
       // Load, then reload so the guest is registered before the page loads
       // (registration happens on the first dom-ready).
       let r = new Promise(x => wv.addEventListener('dom-ready', x, { once: true }));
@@ -83,6 +90,22 @@ export async function runBench(win: BrowserWindow): Promise<void> {
       error: per.at(-1)?.error ?? null,
     };
   };
+
+  const shotDir = process.env.U2S_BENCH_SHOT;
+  if (shotDir) {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const { projectorContents } = await import('./projector');
+    const shots: [string, Electron.WebContents | null][] = [
+      ['projector.png', projectorContents()],
+      ['control.png', win.webContents],
+    ];
+    for (const [name, wc] of shots) {
+      if (!wc) continue;
+      const img = await wc.capturePage();
+      fs.writeFileSync(path.join(shotDir, name), img.toPNG());
+    }
+  }
 
   const os = await import('node:os');
   const summary = {
