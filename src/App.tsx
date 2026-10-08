@@ -534,10 +534,31 @@ function OutputControl({ output }: { output: OutputSettings }) {
   );
 }
 
+const FADE_TIMES = [0.5, 1, 2, 4];
+
 // Top rail: identity, projector, output settings, account; then the A/B fader.
 function VjBar({ status }: { status: AppStatus }) {
+  const [fadeSec, setFadeSec] = useState(1);
   const setAlpha = (a: number) => window.api.setAlpha(a);
-  const fadeTo = (a: number) => window.api.fadeTo(a, 1000); // ~1s crossfade
+  const fadeTo = (a: number) => window.api.fadeTo(a, fadeSec * 1000);
+
+  // Keyboard: Z / X fade to A / B, C cuts to the other side. Ignored while
+  // typing in a text field.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) {
+        if ((t as HTMLInputElement).type !== 'range') return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === 'z') window.api.fadeTo(0, fadeSec * 1000);
+      else if (k === 'x') window.api.fadeTo(1, fadeSec * 1000);
+      else if (k === 'c') window.api.setAlpha(status.alpha < 0.5 ? 1 : 0);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [fadeSec, status.alpha]);
 
   return (
     <div className="vjbar">
@@ -552,7 +573,10 @@ function VjBar({ status }: { status: AppStatus }) {
       </div>
 
       <div className="vjfade">
-        <button onClick={() => fadeTo(0)} title="Fade to A over ~1s">
+        <button onClick={() => setAlpha(0)} title="Cut to A">
+          Cut A
+        </button>
+        <button onClick={() => fadeTo(0)} title={`Fade to A (Z)`}>
           Fade→A
         </button>
         <span className="ab">A</span>
@@ -566,11 +590,28 @@ function VjBar({ status }: { status: AppStatus }) {
           onChange={(e) => setAlpha(Number(e.target.value))}
         />
         <span className="ab">B</span>
-        <button onClick={() => fadeTo(1)} title="Fade to B over ~1s">
+        <button onClick={() => fadeTo(1)} title={`Fade to B (X)`}>
           Fade→B
         </button>
+        <button onClick={() => setAlpha(1)} title="Cut to B">
+          Cut B
+        </button>
+        <label className="quality" title="Fade の長さ">
+          Time
+          <select
+            value={fadeSec}
+            onChange={(e) => setFadeSec(Number(e.target.value))}
+          >
+            {FADE_TIMES.map((s) => (
+              <option key={s} value={s}>
+                {s}s
+              </option>
+            ))}
+          </select>
+        </label>
         <div className="statusline">
           <span className="num">{Math.round(status.alpha * 100)}%</span>
+          <span>Z / X fade · C cut</span>
         </div>
       </div>
     </div>
