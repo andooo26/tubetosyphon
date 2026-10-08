@@ -1,8 +1,11 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { GenCanvas } from './GenView';
 import {
   EMPTY_DECK_STATS,
   mixAt,
+  type CFeed,
   type ChannelId,
+  type MixAnim,
   type DeckFeed,
   type DeckStats,
   type OutputSettings,
@@ -16,7 +19,10 @@ import {
 // one-shot id from main) shown in a plain <video>. The crop to the drawn video
 // and the fit to the display are CSS boxes, and the crossfade is the B deck's
 // opacity over A — so per frame there is no JavaScript at all: decoding,
-// scaling and blending are all done by the GPU compositor. That is what keeps
+// scaling and blending are all done by the GPU compositor. Deck C (generative
+// canvas or a local clip) is one more layer on top with its own opacity and a
+// CSS mix-blend-mode; it is only mounted while visible, so a hidden C costs
+// nothing. That is what keeps
 // this usable on weak PCs, where the old CPU pixel path saturated the main
 // process at ~2 fps.
 
@@ -218,6 +224,70 @@ function Deck({
 }
 
 /**
+ * Drive `ref`'s opacity from a fader (value + optional fade), per display frame
+ * while a fade runs. Layout effect: applied before paint, so a layer never
+ * flashes at the wrong opacity.
+ */
+function useFaderOpacity(
+  ref: React.RefObject<HTMLDivElement | null>,
+  value: number,
+  anim: MixAnim | null,
+  ready: boolean,
+) {
+  useLayoutEffect(() => {
+    let raf = 0;
+    const apply = () => {
+      const el = ref.current;
+      if (!el) return;
+      const now = Date.now();
+      el.style.opacity = String(mixAt(value, anim, now));
+      if (anim && now < anim.start + anim.dur) raf = requestAnimationFrame(apply);
+    };
+    apply();
+    return () => cancelAnimationFrame(raf);
+  }, [value, anim, ready]);
+}
+
+/** Deck C: the generative sketch or a clip, over the A/B mix. */
+function CLayer({ c, output }: { c: CFeed; output: OutputSettings }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const visible = c.anim !== null || c.opacity > 0.001;
+  useFaderOpacity(ref, c.opacity, c.anim, visible);
+  const genW = output.height === 1080 ? 1920 : 1280;
+  const genH = output.height;
+
+  let content: React.ReactNode = null;
+  if (visible && c.source === 'gen') {
+    content = <GenCanvas params={c.gen} width={genW} height={genH} className="projmedia" />;
+  } else if (visible && c.source === 'file' && c.clip) {
+    content =
+      c.clip.kind === 'video' ? (
+        <video
+          key={c.clip.id}
+          className="projmedia"
+          src={c.clip.url}
+          autoPlay
+          loop
+          muted
+          playsInline
+          disablePictureInPicture
+        />
+      ) : (
+        <img key={c.clip.id} className="projmedia" src={c.clip.url} alt="" />
+      );
+  }
+  return (
+    <div
+      className="projc"
+      ref={ref}
+      style={{ mixBlendMode: c.blend as React.CSSProperties['mixBlendMode'] }}
+    >
+      {content}
+    </div>
+  );
+}
+
+/**
  * Root of the fullscreen projector window. Shows only the picture — no UI.
  * Esc closes it.
  */
@@ -247,23 +317,9 @@ export default function ProjectorRoot() {
     };
   }, []);
 
-  // Crossfade = B's opacity over A. A fade is animated here, per display
-  // frame, from the same wall clock main uses for the UI fader.
-  const alpha = state?.alpha ?? 0;
-  const anim = state?.anim ?? null;
-  // Layout effect: applied before paint, so B never flashes at full opacity.
-  useLayoutEffect(() => {
-    let raf = 0;
-    const apply = () => {
-      const b = bRef.current;
-      if (!b) return;
-      const now = Date.now();
-      b.style.opacity = String(mixAt(alpha, anim, now));
-      if (anim && now < anim.start + anim.dur) raf = requestAnimationFrame(apply);
-    };
-    apply();
-    return () => cancelAnimationFrame(raf);
-  }, [alpha, anim, state !== null]);
+  // Crossfade = B's opacity over A, animated here from the same wall clock
+  // main uses for the UI fader.
+  useFaderOpacity(bRef, state?.alpha ?? 0, state?.anim ?? null, state !== null);
 
   if (!state) return <div className="projstage" />;
   return (
@@ -281,6 +337,7 @@ export default function ProjectorRoot() {
         stats={stats.current}
         layerRef={bRef}
       />
+      <CLayer c={state.c} output={state.output} />
     </div>
   );
 }

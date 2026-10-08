@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, screen, webContents } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, screen, webContents } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
 import started from 'electron-squirrel-startup';
@@ -9,6 +9,13 @@ import {
   openGoogleLogin,
   type LoginState,
 } from './login';
+import {
+  MEDIA_EXTENSIONS,
+  handleMediaScheme,
+  makeClip,
+  registerMediaScheme,
+  type ClipEntry,
+} from './media';
 import { setPerfExtra, startPerf } from './perf';
 import { runBench } from './bench';
 import {
@@ -27,10 +34,18 @@ import {
   isWatchUrl,
 } from './youtube';
 import {
+  DEFAULT_GEN_PARAMS,
+  clampGenParams,
+  type GenParams,
+} from './gen/params';
+import {
+  BLENDS,
   CHANNELS,
   DEFAULT_OUTPUT,
   mixAt,
   type AppStatus,
+  type Blend,
+  type CSource,
   type ChannelId,
   type DeckStatus,
   type MixAnim,
@@ -43,7 +58,7 @@ import {
 
 // ---- Architecture -----------------------------------------------------------
 // VJ only: two YouTube players (A / B) crossfaded onto a fullscreen projector
-// window. The main process never touches a pixel — the projector captures the
+// window, plus deck C (generative sketch or a local clip) layered on top. The main process never touches a pixel — the projector captures the
 // players itself (see projector.ts) — so it stays idle no matter how weak the
 // machine is. Main only keeps the small shared state (which guests, crop rects,
 // fader position, output settings) and pushes it to the projector on change.
@@ -52,6 +67,8 @@ import {
 if (started) {
   app.quit();
 }
+
+registerMediaScheme(); // must happen before 'ready'
 
 // Windows: Chromium may present <video> through DirectComposition hardware
 // overlays, which bypass the compositor frame that tab capture copies — the
@@ -123,15 +140,119 @@ function guestOf(ch: Channel): Electron.WebContents | null {
   return g && !g.isDestroyed() ? g : null;
 }
 
-// ---- Mix ----------------------------------------------------------------------
+// ---- Faders -------------------------------------------------------------------
+// The A/B crossfade and deck C's opacity. A fade is sent to the projector as a
+// MixAnim and animated there per display frame; main only ticks the UI.
 
-let alpha = 0; // 0 = A, 1 = B (resting value when no fade is running)
-let anim: MixAnim | null = null;
+class Fader {
+  value: number; // resting value (the target while a fade runs)
+  anim: MixAnim | null = null;
+  constructor(value: number) {
+    this.value = value;
+  }
+  current(now = Date.now()): number {
+    return mixAt(this.value, this.anim, now);
+  }
+  set(v: number) {
+    this.anim = null;
+    this.value = Math.min(1, Math.max(0, v));
+  }
+  fadeTo(target: number, durationMs: number) {
+    const to = Math.min(1, Math.max(0, target));
+    if (!(durationMs > 0)) {
+      this.set(to);
+      return;
+    }
+    this.anim = { from: this.current(), to, start: Date.now(), dur: durationMs };
+    this.value = to;
+  }
+  /** Drop a finished fade. True when one just finished. */
+  settle(now: number): boolean {
+    if (this.anim && now >= this.anim.start + this.anim.dur) {
+      this.anim = null;
+      return true;
+    }
+    return false;
+  }
+}
+
+const mix = new Fader(0); // 0 = A, 1 = B
+const cLevel = new Fader(0); // deck C opacity
 let fadeTimer: NodeJS.Timeout | null = null;
 
-function currentAlpha(): number {
-  return mixAt(alpha, anim, Date.now());
+// While any fade runs, keep the UI faders moving; push the settled state to
+// the projector when one finishes.
+function ensureFadeTimer() {
+  if (fadeTimer) return;
+  fadeTimer = setInterval(() => {
+    const now = Date.now();
+    const mixDone = mix.settle(now);
+    const cDone = cLevel.settle(now);
+    if (mixDone || cDone) pushState();
+    sendStatus();
+    if (!mix.anim && !cLevel.anim && fadeTimer) {
+      clearInterval(fadeTimer);
+      fadeTimer = null;
+    }
+  }, FADE_UI_MS);
 }
+
+function stopFades() {
+  if (fadeTimer) clearInterval(fadeTimer);
+  fadeTimer = null;
+}
+
+// ---- Deck C (persisted) ----------------------------------------------------------
+
+interface CState {
+  source: CSource;
+  blend: Blend;
+  gen: GenParams;
+  clips: ClipEntry[];
+  clipId: string | null;
+}
+
+const c: CState = {
+  source: 'gen',
+  blend: 'screen',
+  gen: { ...DEFAULT_GEN_PARAMS },
+  clips: [],
+  clipId: null,
+};
+
+const cFile = () => path.join(app.getPath('userData'), 'deck-c.json');
+
+function loadC() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(cFile(), 'utf8'));
+    if (raw.source === 'gen' || raw.source === 'file') c.source = raw.source;
+    if (BLENDS.some((b) => b.value === raw.blend)) c.blend = raw.blend;
+    c.gen = clampGenParams(raw.gen ?? {}, c.gen);
+    const paths: unknown[] = Array.isArray(raw.paths) ? raw.paths : [];
+    c.clips = paths
+      .filter((p): p is string => typeof p === 'string' && fs.existsSync(p))
+      .map(makeClip)
+      .filter((x): x is ClipEntry => x !== null);
+    c.clipId = c.clips.some((x) => x.id === raw.clipId) ? raw.clipId : c.clips[0]?.id ?? null;
+  } catch {
+    /* first run */
+  }
+  // The beat grid starts now (the stored epoch is from a previous session).
+  c.gen = { ...c.gen, beatEpoch: Date.now() };
+}
+
+function saveC() {
+  const data = {
+    source: c.source,
+    blend: c.blend,
+    gen: c.gen,
+    paths: c.clips.map((x) => x.path),
+    clipId: c.clipId,
+  };
+  fs.promises.writeFile(cFile(), JSON.stringify(data)).catch((): void => undefined);
+}
+
+const publicClip = ({ id, name, url, kind }: ClipEntry) => ({ id, name, url, kind });
 
 // ---- Output settings (persisted) ----------------------------------------------
 
@@ -295,8 +416,19 @@ function projectorState(): ProjectorState {
   });
   return {
     decks: { left: deck(channels.left), right: deck(channels.right) },
-    alpha,
-    anim,
+    alpha: mix.value,
+    anim: mix.anim,
+    c: {
+      source: c.source,
+      opacity: cLevel.value,
+      anim: cLevel.anim,
+      blend: c.blend,
+      gen: c.gen,
+      clip: (() => {
+        const clip = c.clips.find((x) => x.id === c.clipId);
+        return clip ? publicClip(clip) : null;
+      })(),
+    },
     output,
   };
 }
@@ -313,8 +445,17 @@ function appStatus(): AppStatus {
   return {
     left: deckStatus(channels.left),
     right: deckStatus(channels.right),
-    alpha: currentAlpha(),
-    fading: anim !== null,
+    alpha: mix.current(),
+    fading: mix.anim !== null,
+    c: {
+      source: c.source,
+      opacity: cLevel.current(),
+      fading: cLevel.anim !== null,
+      blend: c.blend,
+      gen: c.gen,
+      clips: c.clips.map(publicClip),
+      clipId: c.clipId,
+    },
     projector: projectorStatus(),
     output,
   };
@@ -326,42 +467,16 @@ function sendStatus() {
   }
 }
 
-function setAlpha(a: number) {
-  stopFade();
-  alpha = Math.min(1, Math.max(0, a));
+function setLevel(f: Fader, v: number) {
+  f.set(v);
   pushState();
   sendStatus();
 }
 
-function stopFade() {
-  if (anim) alpha = currentAlpha(); // freeze where the fade got to
-  anim = null;
-  if (fadeTimer) {
-    clearInterval(fadeTimer);
-    fadeTimer = null;
-  }
-}
-
-function fadeTo(target: number, durationMs: number) {
-  const to = Math.min(1, Math.max(0, target));
-  if (!(durationMs > 0)) {
-    setAlpha(to);
-    return;
-  }
-  const from = currentAlpha();
-  stopFade();
-  alpha = to; // the resting value once the fade completes
-  anim = { from, to, start: Date.now(), dur: durationMs };
+function fadeLevel(f: Fader, target: number, durationMs: number) {
+  f.fadeTo(target, durationMs);
   pushState(); // the projector animates this itself, frame-accurately
-  fadeTimer = setInterval(() => {
-    if (anim && Date.now() >= anim.start + anim.dur) {
-      anim = null;
-      clearInterval(fadeTimer!);
-      fadeTimer = null;
-      pushState();
-    }
-    sendStatus(); // only keeps the UI fader moving
-  }, FADE_UI_MS);
+  if (f.anim) ensureFadeTimer();
   sendStatus();
 }
 
@@ -414,17 +529,81 @@ ipcMain.handle('app:set-quality', (_e, channelId: ChannelId, quality: Quality) =
   return { ok: true };
 });
 
-ipcMain.handle('app:set-alpha', (_e, a: number) => {
-  if (typeof a !== 'number' || !isFinite(a)) return { ok: false, error: 'bad alpha' };
-  setAlpha(a);
+const faderOf = (which: unknown) => (which === 'c' ? cLevel : which === 'mix' ? mix : null);
+
+ipcMain.handle('app:set-level', (_e, which: 'mix' | 'c', v: number) => {
+  const f = faderOf(which);
+  if (!f || typeof v !== 'number' || !isFinite(v)) return { ok: false, error: 'bad level' };
+  setLevel(f, v);
   return { ok: true };
 });
 
-ipcMain.handle('app:fade', (_e, target: number, durationMs: number) => {
-  if (typeof target !== 'number' || !isFinite(target)) {
+ipcMain.handle('app:fade', (_e, which: 'mix' | 'c', target: number, durationMs: number) => {
+  const f = faderOf(which);
+  if (!f || typeof target !== 'number' || !isFinite(target)) {
     return { ok: false, error: 'bad target' };
   }
-  fadeTo(target, typeof durationMs === 'number' ? durationMs : 0);
+  fadeLevel(f, target, typeof durationMs === 'number' ? durationMs : 0);
+  return { ok: true };
+});
+
+// ---- IPC: deck C -----------------------------------------------------------------
+
+function cChanged() {
+  saveC();
+  pushState();
+  sendStatus();
+}
+
+ipcMain.handle(
+  'app:c-set',
+  (_e, patch: { source?: CSource; blend?: Blend; clipId?: string }) => {
+    if (patch?.source === 'gen' || patch?.source === 'file') c.source = patch.source;
+    if (BLENDS.some((b) => b.value === patch?.blend)) c.blend = patch.blend as Blend;
+    if (c.clips.some((x) => x.id === patch?.clipId)) c.clipId = patch.clipId as string;
+    cChanged();
+    return { ok: true };
+  },
+);
+
+ipcMain.handle('app:c-gen', (_e, patch: Partial<GenParams>) => {
+  if (!patch || typeof patch !== 'object') return { ok: false, error: 'bad params' };
+  c.gen = clampGenParams(patch, c.gen);
+  cChanged();
+  return { ok: true };
+});
+
+ipcMain.handle('app:c-add-clips', async () => {
+  const opts: Electron.OpenDialogOptions = {
+    title: 'Deck C に素材を追加',
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Video / Image', extensions: MEDIA_EXTENSIONS }],
+  };
+  const res = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, opts)
+    : await dialog.showOpenDialog(opts);
+  if (res.canceled) return { ok: true };
+  let last: string | null = null;
+  for (const p of res.filePaths) {
+    const clip = makeClip(p);
+    if (!clip) continue;
+    if (!c.clips.some((x) => x.id === clip.id)) c.clips.push(clip);
+    last = clip.id;
+  }
+  if (last) {
+    c.clipId = last; // select what was just added
+    c.source = 'file';
+  }
+  cChanged();
+  return { ok: true };
+});
+
+ipcMain.handle('app:c-remove-clip', (_e, id: string) => {
+  const i = c.clips.findIndex((x) => x.id === id);
+  if (i < 0) return { ok: false, error: 'unknown clip' };
+  c.clips.splice(i, 1);
+  if (c.clipId === id) c.clipId = c.clips[Math.min(i, c.clips.length - 1)]?.id ?? null;
+  cChanged();
   return { ok: true };
 });
 
@@ -538,6 +717,8 @@ function runSelfTest() {
 
 app.on('ready', () => {
   output = loadOutput();
+  loadC();
+  handleMediaScheme((id) => c.clips.find((x) => x.id === id) ?? null);
   if (process.env.U2S_SELFTEST === '1') {
     runSelfTest();
     return;
@@ -561,7 +742,7 @@ app.on('ready', () => {
 });
 
 app.on('window-all-closed', () => {
-  stopFade();
+  stopFades();
   if (rectTimer) clearInterval(rectTimer);
   rectTimer = null;
   if (process.platform !== 'darwin') {

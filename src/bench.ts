@@ -67,7 +67,7 @@ export async function runBench(win: BrowserWindow): Promise<void> {
       wv.reload();
       await r;
     }
-    await window.api.setAlpha(${alpha});
+    await window.api.setLevel('mix', ${alpha});
     ${useProjector ? `await window.api.openProjector(${projDisplay});` : ''}
     return true;
   })()`;

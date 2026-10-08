@@ -1,6 +1,8 @@
 // Types + small helpers shared by the main process, the preload and both
 // renderer roots (control UI and projector).
 
+import type { GenParams } from './gen/params';
+
 /**
  * Session partition used by both player <webview>s and the Google login window.
  * Sharing one partition means a single login (cookies) applies to both players.
@@ -63,11 +65,58 @@ export interface OutputSettings {
 
 export const DEFAULT_OUTPUT: OutputSettings = { height: 1080, fps: 60 };
 
+// ---- Deck C: a layer over the A/B mix --------------------------------------
+// Either the generative sketch (汎用) or a local video/image clip, composited
+// over the A/B crossfade with its own opacity and a CSS blend mode.
+
+export type CSource = 'gen' | 'file';
+
+/** CSS mix-blend-mode values offered for deck C. */
+export type Blend = 'normal' | 'screen' | 'plus-lighter' | 'multiply' | 'difference';
+
+export const BLENDS: { value: Blend; label: string }[] = [
+  { value: 'normal', label: 'Normal' },
+  { value: 'screen', label: 'Screen' },
+  { value: 'plus-lighter', label: 'Add' },
+  { value: 'multiply', label: 'Multiply' },
+  { value: 'difference', label: 'Difference' },
+];
+
+/** A local media file registered for deck C. */
+export interface Clip {
+  id: string;
+  name: string; // file name, for display
+  url: string; // u2s-media:// URL served by main (never a raw path)
+  kind: 'video' | 'image';
+}
+
+/** Deck C as the projector needs it. */
+export interface CFeed {
+  source: CSource;
+  opacity: number; // resting value (see anim)
+  anim: MixAnim | null;
+  blend: Blend;
+  gen: GenParams;
+  clip: Clip | null;
+}
+
+/** Deck C as the control UI shows it. */
+export interface CStatus {
+  source: CSource;
+  opacity: number; // current value, fade included
+  fading: boolean;
+  blend: Blend;
+  gen: GenParams;
+  clips: Clip[];
+  clipId: string | null;
+}
+
 /** Everything the projector window renders from (pushed by main on change). */
 export interface ProjectorState {
   decks: Record<ChannelId, DeckFeed>;
   alpha: number; // 0 = A (left), 1 = B (right)
   anim: MixAnim | null;
+  c: CFeed;
   output: OutputSettings;
 }
 
@@ -114,6 +163,7 @@ export interface AppStatus {
   right: DeckStatus;
   alpha: number;
   fading: boolean;
+  c: CStatus;
   projector: ProjectorStatus;
   output: OutputSettings;
 }

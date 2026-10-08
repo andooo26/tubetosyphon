@@ -1,7 +1,10 @@
 import { contextBridge, ipcRenderer, clipboard } from 'electron';
+import type { GenParams } from './gen/params';
 import type { LoginState } from './login';
 import type {
   AppStatus,
+  Blend,
+  CSource,
   ChannelId,
   OutputSettings,
   ProjectorState,
@@ -12,6 +15,7 @@ import type {
 export type { LoginState };
 
 type Result = Promise<{ ok: boolean; error?: string }>;
+type Fader = 'mix' | 'c';
 
 function subscribe<T>(channel: string, cb: (v: T) => void): () => void {
   const listener = (_e: unknown, v: T) => cb(v);
@@ -29,9 +33,17 @@ const api = {
     ipcRenderer.invoke('app:set-hide-controls', channel, on),
   setQuality: (channel: ChannelId, quality: Quality): Result =>
     ipcRenderer.invoke('app:set-quality', channel, quality),
-  setAlpha: (alpha: number): Result => ipcRenderer.invoke('app:set-alpha', alpha),
-  fadeTo: (target: number, durationMs: number): Result =>
-    ipcRenderer.invoke('app:fade', target, durationMs),
+  /** Set a fader: 'mix' = the A/B crossfade, 'c' = deck C's opacity. */
+  setLevel: (which: Fader, value: number): Result =>
+    ipcRenderer.invoke('app:set-level', which, value),
+  fade: (which: Fader, target: number, durationMs: number): Result =>
+    ipcRenderer.invoke('app:fade', which, target, durationMs),
+  setC: (patch: { source?: CSource; blend?: Blend; clipId?: string }): Result =>
+    ipcRenderer.invoke('app:c-set', patch),
+  setGen: (patch: Partial<GenParams>): Result => ipcRenderer.invoke('app:c-gen', patch),
+  /** Pick video/image files for deck C (native file dialog). */
+  addClips: (): Result => ipcRenderer.invoke('app:c-add-clips'),
+  removeClip: (id: string): Result => ipcRenderer.invoke('app:c-remove-clip', id),
   setOutput: (patch: Partial<OutputSettings>): Result =>
     ipcRenderer.invoke('app:set-output', patch),
   getStatus: (): Promise<AppStatus> => ipcRenderer.invoke('app:get-status'),

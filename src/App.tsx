@@ -1,10 +1,21 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { LoginState } from './preload';
+import { GenCanvas } from './GenView';
 import {
+  DEFAULT_GEN_PARAMS,
+  GENRES,
+  MAX_BPM,
+  MIN_BPM,
+  type GenParams,
+  type Genre,
+} from './gen/params';
+import {
+  BLENDS,
   DEFAULT_OUTPUT,
   EMPTY_DECK_STATS,
   PLAYER_PARTITION,
   type AppStatus,
+  type Blend,
   type ChannelId,
   type DeckStats,
   type DeckStatus,
@@ -75,6 +86,15 @@ const EMPTY_STATUS: AppStatus = {
   right: EMPTY_DECK,
   alpha: 0,
   fading: false,
+  c: {
+    source: 'gen',
+    opacity: 0,
+    fading: false,
+    blend: 'screen',
+    gen: DEFAULT_GEN_PARAMS,
+    clips: [],
+    clipId: null,
+  },
   projector: {
     open: false,
     displayId: null,
@@ -546,34 +566,23 @@ function OutputControl({ output }: { output: OutputSettings }) {
 const FADE_TIMES = [0.5, 1, 2, 4];
 
 // Top rail: identity, projector, output settings, account; then the A/B fader.
-function VjBar({ status }: { status: AppStatus }) {
-  const [fadeSec, setFadeSec] = useState(1);
-  const setAlpha = (a: number) => window.api.setAlpha(a);
-  const fadeTo = (a: number) => window.api.fadeTo(a, fadeSec * 1000);
-
-  // Keyboard: Z / X fade to A / B, C cuts to the other side. Ignored while
-  // typing in a text field.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement | null;
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) {
-        if ((t as HTMLInputElement).type !== 'range') return;
-      }
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const k = e.key.toLowerCase();
-      if (k === 'z') window.api.fadeTo(0, fadeSec * 1000);
-      else if (k === 'x') window.api.fadeTo(1, fadeSec * 1000);
-      else if (k === 'c') window.api.setAlpha(status.alpha < 0.5 ? 1 : 0);
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [fadeSec, status.alpha]);
+function VjBar({
+  status,
+  fadeSec,
+  setFadeSec,
+}: {
+  status: AppStatus;
+  fadeSec: number;
+  setFadeSec: (s: number) => void;
+}) {
+  const setAlpha = (a: number) => window.api.setLevel('mix', a);
+  const fadeTo = (a: number) => window.api.fade('mix', a, fadeSec * 1000);
 
   return (
     <div className="vjbar">
       <div className="modes">
         <span className="wordmark">Tube VJ</span>
-        <span className="wordmark">A / B → projector</span>
+        <span className="wordmark">A / B + C → projector</span>
         <div className="railgroup">
           <ProjectorControl status={status} />
           <OutputControl output={status.output} />
@@ -585,7 +594,7 @@ function VjBar({ status }: { status: AppStatus }) {
         <button onClick={() => setAlpha(0)} title="Cut to A">
           Cut A
         </button>
-        <button onClick={() => fadeTo(0)} title={`Fade to A (Z)`}>
+        <button onClick={() => fadeTo(0)} title="Fade to A (Z)">
           Fade→A
         </button>
         <span className="ab">A</span>
@@ -599,13 +608,13 @@ function VjBar({ status }: { status: AppStatus }) {
           onChange={(e) => setAlpha(Number(e.target.value))}
         />
         <span className="ab">B</span>
-        <button onClick={() => fadeTo(1)} title={`Fade to B (X)`}>
+        <button onClick={() => fadeTo(1)} title="Fade to B (X)">
           Fade→B
         </button>
         <button onClick={() => setAlpha(1)} title="Cut to B">
           Cut B
         </button>
-        <label className="quality" title="Fade の長さ">
+        <label className="quality" title="Fade の長さ（A/B と C 共通）">
           Time
           <select
             value={fadeSec}
@@ -620,25 +629,297 @@ function VjBar({ status }: { status: AppStatus }) {
         </label>
         <div className="statusline">
           <span className="num">{Math.round(status.alpha * 100)}%</span>
-          <span>Z / X fade · C cut</span>
+          <span>Z / X fade · C cut · V deck C</span>
         </div>
       </div>
     </div>
   );
 }
 
+/** Clock + look controls for the generative source (same as 汎用 on main). */
+function GenControls({ p }: { p: GenParams }) {
+  // Tap-tempo timestamps (most recent last). Kept in a ref — taps don't need to
+  // re-render anything by themselves.
+  const taps = useRef<number[]>([]);
+  const patch = (next: Partial<GenParams>) => window.api.setGen(next);
+
+  const tap = () => {
+    const now = Date.now();
+    // A gap longer than 2s starts a new measurement.
+    if (taps.current.length && now - taps.current[taps.current.length - 1] > 2000) {
+      taps.current = [];
+    }
+    taps.current.push(now);
+    if (taps.current.length > 5) taps.current.shift();
+    if (taps.current.length >= 2) {
+      const first = taps.current[0];
+      const spans = taps.current.length - 1;
+      const bpm = 60000 / ((now - first) / spans);
+      // The last tap is a beat, so anchor the grid to it as well.
+      patch({ bpm: Math.round(bpm * 10) / 10, beatEpoch: now });
+    } else {
+      patch({ beatEpoch: now });
+    }
+  };
+
+  const changeGenre = (genre: Genre) => {
+    // Adopt the genre's typical tempo so the preset lands in a sensible range.
+    const preset = GENRES.find((g) => g.value === genre);
+    patch({ genre, bpm: preset?.bpm ?? p.bpm });
+  };
+
+  return (
+    <>
+      <div className="genrow">
+        <label className="quality">
+          Genre
+          <select
+            value={p.genre}
+            onChange={(e) => changeGenre(e.target.value as Genre)}
+          >
+            {GENRES.map((g) => (
+              <option key={g.value} value={g.value}>
+                {g.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <div className="genrow">
+        <label className="quality">
+          BPM
+          <input
+            className="bpm"
+            type="number"
+            min={MIN_BPM}
+            max={MAX_BPM}
+            step={0.1}
+            value={p.bpm}
+            onChange={(e) => patch({ bpm: Number(e.target.value) })}
+          />
+        </label>
+        <button onClick={tap} title="拍に合わせて4回タップ">
+          Tap
+        </button>
+        <button
+          onClick={() => patch({ beatEpoch: Date.now() })}
+          title="拍の頭を今に合わせ直す"
+        >
+          Sync
+        </button>
+        <button
+          onClick={() => patch({ seed: Math.floor(Math.random() * 100000) })}
+          title="構図・配色の乱数を引き直す"
+        >
+          Shuffle
+        </button>
+      </div>
+      <label className="quality slider">
+        Intensity
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.01}
+          value={p.intensity}
+          onChange={(e) => patch({ intensity: Number(e.target.value) })}
+        />
+      </label>
+      <label className="quality slider">
+        Tint
+        <input
+          type="range"
+          min={0}
+          max={359}
+          step={1}
+          value={p.hue}
+          onChange={(e) => patch({ hue: Number(e.target.value) })}
+        />
+      </label>
+    </>
+  );
+}
+
+/** Local clips: pick one, add more, remove. */
+function ClipList({ c }: { c: AppStatus['c'] }) {
+  const add = async () => {
+    const res = await window.api.addClips();
+    if (!res.ok && res.error) alert(res.error);
+  };
+  return (
+    <>
+      <div className="cliplist">
+        {c.clips.length === 0 && (
+          <div className="genhint">動画・画像ファイルを追加してください</div>
+        )}
+        {c.clips.map((clip) => (
+          <div
+            key={clip.id}
+            className={`clip ${clip.id === c.clipId ? 'on' : ''}`}
+          >
+            <button
+              className="clipname"
+              onClick={() => window.api.setC({ clipId: clip.id })}
+              title={clip.name}
+            >
+              {clip.kind === 'video' ? '▶ ' : '▣ '}
+              {clip.name}
+            </button>
+            <button
+              className="clipdel"
+              onClick={() => window.api.removeClip(clip.id)}
+              title="リストから外す（ファイルは消えません）"
+            >
+              ×
+            </button>
+          </div>
+        ))}
+      </div>
+      <button onClick={add} title="mp4 / mov / webm / png / jpg / gif / webp">
+        + Add files
+      </button>
+    </>
+  );
+}
+
+/** Small live preview of deck C. Off by default: it costs a second render. */
+function CPreview({ c }: { c: AppStatus['c'] }) {
+  const clip = c.clips.find((x) => x.id === c.clipId) ?? null;
+  if (c.source === 'gen') {
+    return <GenCanvas params={c.gen} width={480} height={270} className="cthumb" />;
+  }
+  if (!clip) return <div className="cthumb" />;
+  return clip.kind === 'video' ? (
+    <video
+      key={clip.id}
+      className="cthumb"
+      src={clip.url}
+      autoPlay
+      loop
+      muted
+      playsInline
+    />
+  ) : (
+    <img key={clip.id} className="cthumb" src={clip.url} alt="" />
+  );
+}
+
+// Deck C: generative sketch or a local clip, layered over the A/B mix.
+function CPanel({ c, fadeSec }: { c: AppStatus['c']; fadeSec: number }) {
+  const [preview, setPreview] = useState(false);
+  const setLevel = (v: number) => window.api.setLevel('c', v);
+  const fadeTo = (v: number) => window.api.fade('c', v, fadeSec * 1000);
+  const on = c.opacity > 0.001;
+
+  return (
+    <div className="cpanel">
+      <div className="crow">
+        <b className="chanid">C</b>
+        <div className="segmented">
+          <button
+            className={c.source === 'gen' ? 'primary' : ''}
+            onClick={() => window.api.setC({ source: 'gen' })}
+            title="ジェネラティブ映像（汎用）"
+          >
+            Gen
+          </button>
+          <button
+            className={c.source === 'file' ? 'primary' : ''}
+            onClick={() => window.api.setC({ source: 'file' })}
+            title="手元の動画・画像ファイル"
+          >
+            File
+          </button>
+        </div>
+        <span className={`dot ${on ? 'on' : 'off'}`} />
+      </div>
+
+      <div className="crow">
+        <input
+          className="cfader"
+          type="range"
+          min={0}
+          max={1}
+          step={0.001}
+          value={c.opacity}
+          onChange={(e) => setLevel(Number(e.target.value))}
+          title="C の不透明度"
+        />
+        <span className="num cnum">{Math.round(c.opacity * 100)}%</span>
+      </div>
+      <div className="crow">
+        <button onClick={() => fadeTo(1)} title="C をフェードイン (V)">
+          In
+        </button>
+        <button onClick={() => fadeTo(0)} title="C をフェードアウト (V)">
+          Out
+        </button>
+        <label className="quality" title="A/B の上への重ね方">
+          Blend
+          <select
+            value={c.blend}
+            onChange={(e) => window.api.setC({ blend: e.target.value as Blend })}
+          >
+            {BLENDS.map((b) => (
+              <option key={b.value} value={b.value}>
+                {b.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      <div className="csection">
+        {c.source === 'gen' ? <GenControls p={c.gen} /> : <ClipList c={c} />}
+      </div>
+
+      <div className="crow">
+        <button
+          className={preview ? 'primary' : ''}
+          onClick={() => setPreview(!preview)}
+          title="C の小さなプレビュー（描画が1つ増えるので、重いときはオフ）"
+        >
+          Preview
+        </button>
+      </div>
+      {preview && <CPreview c={c} />}
+    </div>
+  );
+}
+
 export default function App() {
   const [status, setStatus] = useState<AppStatus>(EMPTY_STATUS);
+  const [fadeSec, setFadeSec] = useState(1);
 
   useEffect(() => {
     window.api.getStatus().then(setStatus);
     return window.api.onStatus(setStatus);
   }, []);
 
+  // Keyboard: Z / X fade to A / B, C cuts to the other side, V fades deck C
+  // in or out. Ignored while typing in a text field.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) {
+        if ((t as HTMLInputElement).type !== 'range') return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const ms = fadeSec * 1000;
+      const k = e.key.toLowerCase();
+      if (k === 'z') window.api.fade('mix', 0, ms);
+      else if (k === 'x') window.api.fade('mix', 1, ms);
+      else if (k === 'c') window.api.setLevel('mix', status.alpha < 0.5 ? 1 : 0);
+      else if (k === 'v') window.api.fade('c', status.c.opacity < 0.5 ? 1 : 0, ms);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [fadeSec, status.alpha, status.c.opacity]);
+
   const projecting = status.projector.open;
   return (
     <div className="app">
-      <VjBar status={status} />
+      <VjBar status={status} fadeSec={fadeSec} setFadeSec={setFadeSec} />
       <div className="players">
         <Player
           channel="left"
@@ -653,6 +934,8 @@ export default function App() {
           proj={status.projector.stats.right}
           projecting={projecting}
         />
+        <div className="divider" />
+        <CPanel c={status.c} fadeSec={fadeSec} />
       </div>
     </div>
   );
