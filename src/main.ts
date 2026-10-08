@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, screen, webContents } from 'electron';
+import fs from 'node:fs';
 import path from 'node:path';
 import started from 'electron-squirrel-startup';
-import { OUTPUT_PROTOCOL, createOutput, type FrameOutput } from './output';
 import {
   getLoginState,
   installLoginHeaderFilter,
@@ -9,36 +9,53 @@ import {
   openGoogleLogin,
   type LoginState,
 } from './login';
-import { perfAdd, startPerf } from './perf';
+import { setPerfExtra, startPerf } from './perf';
 import { runBench } from './bench';
 import {
-  activeProjectorSource,
   closeProjector,
   handleDisplayRemoved,
+  isProjectorOpen,
   openProjector,
-  projectFrame,
-  projectorFrameDone,
   projectorStatus,
-  sendToProjector,
-  setProjectorSource,
-  type ProjectorSource,
+  sendProjectorState,
+  setProjectorStats,
 } from './projector';
-import type { Quality } from './preload';
 import {
-  DEFAULT_GEN_PARAMS,
-  clampGenParams,
-  type GenParams,
-} from './gen/params';
+  AD_SKIP_JS,
+  CHROME_HIDE_CSS,
+  VIDEO_RECT_JS,
+  isWatchUrl,
+} from './youtube';
+import {
+  CHANNELS,
+  DEFAULT_OUTPUT,
+  mixAt,
+  type AppStatus,
+  type ChannelId,
+  type DeckStatus,
+  type MixAnim,
+  type OutputSettings,
+  type ProjectorState,
+  type ProjectorStats,
+  type Quality,
+  type VideoRect,
+} from './shared';
+
+// ---- Architecture -----------------------------------------------------------
+// VJ only: two YouTube players (A / B) crossfaded onto a fullscreen projector
+// window. The main process never touches a pixel — the projector captures the
+// players itself (see projector.ts) — so it stays idle no matter how weak the
+// machine is. Main only keeps the small shared state (which guests, crop rects,
+// fader position, output settings) and pushes it to the projector on change.
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (started) {
   app.quit();
 }
 
-// Windows: Chromium presents <video> through DirectComposition hardware
-// overlays, which bypass the compositor frame that beginFrameSubscription
-// captures — the video plays smoothly on screen, but the capture only gets a
-// new frame when something *else* on the page repaints (a few per second).
+// Windows: Chromium may present <video> through DirectComposition hardware
+// overlays, which bypass the compositor frame that tab capture copies — the
+// projector would then only get a new frame when something else repaints.
 // Compositing video normally keeps every video frame capturable.
 // U2S_KEEP_VIDEO_OVERLAYS=1 skips this (to A/B the effect).
 if (
@@ -55,327 +72,114 @@ if (process.env.U2S_BENCH && process.platform === 'win32') {
   app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 }
 
-// ---- Output constants (spec: 1080p fixed, ~60fps) -------------------------
-const OUT_W = 1920;
-const OUT_H = 1080;
-// Live frames are pushed by beginFrameSubscription at the compositor's paint
-// cadence (up to display refresh). This slow timer only drives the generated
-// static frames (red test / black-while-browsing) and the video-rect refresh.
-const STATIC_TICK_MS = 150;
+// While the projector is open, how often each player's drawn-video rect is
+// re-measured (a cheap executeJavaScript round-trip, not per frame).
+const RECT_POLL_MS = 500;
+// UI refresh rate while a fade animates (the projector animates on its own).
+const FADE_UI_MS = 50;
 
-// ---- Channels (two independent players: left + right) ---------------------
-// Each channel drives its own <webview> guest, its own Syphon server, and its
-// own capture loop, so the two sides publish two separate Syphon sources.
-type ChannelId = 'left' | 'right';
+// ---- Decks (A = left, B = right) ---------------------------------------------
 
 interface Channel {
   readonly id: ChannelId;
-  readonly serverName: string;
-  readonly syphon: FrameOutput; // Syphon (macOS) / Spout (Windows)
   guestContentsId: number | null;
-  onWatchPage: boolean; // capture real video? false only on a YouTube browse page (-> black).
-  isYouTube: boolean; // current guest page is YouTube (video fills the viewport via our CSS).
-  // Drawn-video region to capture, in guest CSS px, plus the viewport CSS size it
-  // was measured against (so onFrame can rescale it to the subscription image's
-  // device-pixel dimensions — Retina makes them differ).
-  videoRect: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-    viewW: number;
-    viewH: number;
-  } | null;
-  videoRectStamp: number; // when videoRect was last measured (throttle the JS round-trip)
-  captureTimer: NodeJS.Timeout | null; // slow timer: static (red/black) frames + rect refresh
-  subscribedContentsId: number | null; // guest we've called beginFrameSubscription on
-  rectRefreshing: boolean; // a VIDEO_RECT_JS round-trip is in flight
-  inFlight: boolean; // capturePage is async; skip a tick if the last is still running.
-  testFrame: boolean; // publish a solid red frame instead of the webview.
-  hideControls: boolean; // hide YouTube's playback bar + captions.
-  quality: Quality; // target YouTube playback quality (re-asserted by the injected JS).
-  hideCssKey: string | null; // insertCSS key for the CURRENT page (invalidated on navigation).
-  framesThisSecond: number;
-  lastFpsStamp: number;
-  measuredFps: number;
-  // Capture diagnostics (shown in the fps tooltip): frames the subscription
-  // delivered per second, and the average onFrame processing time.
-  capThisSecond: number;
-  capMsThisSecond: number;
-  capStamp: number;
-  captureFps: number;
-  frameMs: number;
-  frameBuf: Uint8Array | null; // reused OUT_W*OUT_H*4 RGBA letterbox canvas (grown never shrunk)
-  lbW: number; // last letterboxed video width (to know when black bars must be re-cleared)
-  lbH: number; // last letterboxed video height
-  latest: Uint8Array | null; // most recent OUT_W*OUT_H RGBA frame (for the VJ mixer to blend)
+  live: boolean; // false only on a YouTube browse page (-> projects black)
+  isYouTube: boolean; // the video fills the viewport via our CSS -> crop to it
+  videoRect: VideoRect | null;
+  rectBusy: boolean; // a VIDEO_RECT_JS round-trip is in flight
+  hideControls: boolean; // hide YouTube's playback bar + captions
+  quality: Quality; // target YouTube playback quality
+  hideCssKey: string | null; // insertCSS key for the CURRENT page
 }
 
-function makeChannel(id: ChannelId, serverName: string): Channel {
+function makeChannel(id: ChannelId): Channel {
   return {
     id,
-    serverName,
-    syphon: createOutput(serverName),
     guestContentsId: null,
-    onWatchPage: false,
+    live: false,
     isYouTube: false,
     videoRect: null,
-    videoRectStamp: 0,
-    captureTimer: null,
-    subscribedContentsId: null,
-    rectRefreshing: false,
-    inFlight: false,
-    testFrame: false,
+    rectBusy: false,
     hideControls: true,
-    quality: 'highest',
+    // The projector never needs more than 1080p, and decoding 4K on two decks
+    // is the single most expensive thing a weak PC could be asked to do.
+    quality: 'hd1080',
     hideCssKey: null,
-    framesThisSecond: 0,
-    lastFpsStamp: Date.now(),
-    measuredFps: 0,
-    capThisSecond: 0,
-    capMsThisSecond: 0,
-    capStamp: Date.now(),
-    captureFps: 0,
-    frameMs: 0,
-    frameBuf: null,
-    lbW: -1,
-    lbH: -1,
-    latest: null,
   };
 }
 
 const channels: Record<ChannelId, Channel> = {
-  left: makeChannel('left', 'URLtoSyphon-L'),
-  right: makeChannel('right', 'URLtoSyphon-R'),
+  left: makeChannel('left'),
+  right: makeChannel('right'),
 };
 
 function getChannel(id: unknown): Channel | null {
   return id === 'left' || id === 'right' ? channels[id] : null;
 }
 
-// ---- VJ mode --------------------------------------------------------------
-// One combined Syphon output that crossfades between the two players. In 'vj'
-// mode the per-channel Syphon servers are stopped; both channels keep capturing
-// (into ch.latest) and a single mixer blends L/R by vjAlpha and publishes to one
-// server. In 'dual' mode each channel publishes to its own server as before.
-type Mode = 'dual' | 'vj';
-let mode: Mode = 'dual';
-let vjAlpha = 0; // 0 = full A (left), 1 = full B (right)
-// Active crossfade animation (Cut A/B fade over a duration instead of jumping).
-let vjAnim: { from: number; to: number; start: number; dur: number } | null = null;
-const vjSyphon = createOutput('TubeToSyphon');
-let vjTimer: NodeJS.Timeout | null = null;
-let vjBuf: Uint8Array | null = null; // OUT_W*OUT_H*4 RGBA blend scratch
-let vjFramesThisSecond = 0;
-let vjLastFpsStamp = Date.now();
-let vjMeasuredFps = 0;
-const VJ_INTERVAL_MS = 16; // ~60fps output
+function guestOf(ch: Channel): Electron.WebContents | null {
+  if (ch.guestContentsId == null) return null;
+  const g = webContents.fromId(ch.guestContentsId);
+  return g && !g.isDestroyed() ? g : null;
+}
+
+// ---- Mix ----------------------------------------------------------------------
+
+let alpha = 0; // 0 = A, 1 = B (resting value when no fade is running)
+let anim: MixAnim | null = null;
+let fadeTimer: NodeJS.Timeout | null = null;
+
+function currentAlpha(): number {
+  return mixAt(alpha, anim, Date.now());
+}
+
+// ---- Output settings (persisted) ----------------------------------------------
+
+const settingsFile = () => path.join(app.getPath('userData'), 'output.json');
+
+function loadOutput(): OutputSettings {
+  try {
+    const raw = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
+    return clampOutput(raw, DEFAULT_OUTPUT);
+  } catch {
+    return { ...DEFAULT_OUTPUT };
+  }
+}
+
+function clampOutput(
+  patch: Partial<OutputSettings>,
+  base: OutputSettings,
+): OutputSettings {
+  return {
+    height: patch?.height === 720 || patch?.height === 1080 ? patch.height : base.height,
+    fps: patch?.fps === 30 || patch?.fps === 60 ? patch.fps : base.fps,
+  };
+}
+
+let output: OutputSettings = DEFAULT_OUTPUT;
 
 let mainWindow: BrowserWindow | null = null;
 
-// ---- 汎用 (generic) mode --------------------------------------------------
-// No video source at all: a hidden 1920x1080 **offscreen** BrowserWindow renders
-// the generative sketch (src/gen/sketch.ts, same bundle as the UI, loaded with
-// ?gen=1) driven by BPM + genre, and every painted frame is published to a
-// single Syphon server. Offscreen rendering hands us the finished 1920x1080
-// BGRA bitmap directly, so there is no crop/letterbox step here.
-const genSyphon = createOutput('TubeToSyphon-GEN');
-let genWindow: BrowserWindow | null = null;
-let genParams: GenParams = { ...DEFAULT_GEN_PARAMS, beatEpoch: Date.now() };
-let genFramesThisSecond = 0;
-let genLastFpsStamp = Date.now();
-let genMeasuredFps = 0;
-const GEN_FPS = 60;
-
-// A YouTube *playback* URL (watch / shorts / youtu.be) as opposed to a browse
-// page (home, search results, channel). Only playback pages get the
-// "video only" treatment + real Syphon output; browse pages stay full-UI and
-// output black so the user can navigate in-app without leaking the page.
-function isWatchUrl(url: string): boolean {
-  return /youtube\.com\/watch|youtube\.com\/shorts\/|youtu\.be\//.test(url);
-}
-
-// ---- YouTube "video only" + best-effort ad handling -----------------------
-// Injected into the guest <webview> on every navigation. CSS collapses the
-// watch page down to just the player (no masthead / sidebar / comments), so
-// capturePage() grabs a clean frame. JS auto-clicks "Skip Ad" and fast-forwards
-// through unskippable ads.
-const PLAYER_ONLY_CSS = `
-  /* hide everything except the player */
-  #masthead-container, ytd-masthead, #secondary, #secondary-inner,
-  #below, #comments, ytd-comments, #chat, #related, tp-yt-app-drawer,
-  ytd-merch-shelf-renderer, #owner, #meta, ytd-watch-metadata,
-  .ytp-pause-overlay, .ytp-ce-element, .iv-branding {
-    display: none !important;
-  }
-  html, body { overflow: hidden !important; background: #000 !important; }
-  ytd-app, #content, ytd-page-manager, #page-manager,
-  ytd-watch-flexy, #primary, #primary-inner, #player, #player-container,
-  #player-container-outer, #player-container-inner {
-    margin: 0 !important; padding: 0 !important; max-width: none !important;
-  }
-  #movie_player, .html5-video-player {
-    position: fixed !important; inset: 0 !important;
-    width: 100vw !important; height: 100vh !important; z-index: 2147483647 !important;
-  }
-  video.html5-main-video {
-    position: fixed !important; inset: 0 !important;
-    width: 100vw !important; height: 100vh !important; object-fit: contain !important;
-    left: 0 !important; top: 0 !important; transform: none !important;
-  }
-`;
-
-// Hides the playback/seek bar + controls and captions so the captured frame is
-// clean video only. Managed separately from PLAYER_ONLY_CSS (inserted/removed
-// via a tracked key) so the UI can toggle it on and off at runtime.
-const CHROME_HIDE_CSS = `
-  /* playback/seek bar + controls + gradients */
-  .ytp-chrome-bottom, .ytp-chrome-top, .ytp-gradient-bottom, .ytp-gradient-top,
-  .ytp-progress-bar-container, .ytp-chrome-controls {
-    display: none !important;
-  }
-  /* captions / subtitles */
-  .ytp-caption-window-container, .caption-window, .ytp-caption-segment,
-  .captions-text {
-    display: none !important;
-  }
-`;
-
-// Player-only CSS re-asserted from JS. insertCSS (below) is the fast path, but
-// on a fresh watch-page load the single insertion sometimes lands on the wrong
-// navigation event (YouTube is a SPA that re-navigates in-page + rebuilds the
-// DOM), so ~1 load in N the full page chrome slips through. Injecting the same
-// rules as a persistent <style> that the interval re-adds if missing makes the
-// "video only" layout self-healing regardless of navigation timing.
-const PLAYER_ONLY_JS_LITERAL = JSON.stringify(PLAYER_ONLY_CSS);
-
-const AD_SKIP_JS = `
-  (function () {
-    if (window.__u2s_adskip) return;
-    window.__u2s_adskip = true;
-    var PLAYER_ONLY_CSS = ${PLAYER_ONLY_JS_LITERAL};
-    function isWatchPage() {
-      return /youtube\\.com\\/watch|youtube\\.com\\/shorts\\/|youtu\\.be\\//.test(location.href);
-    }
-    function ensurePlayerOnlyStyle() {
-      var el = document.getElementById('__u2s_player_only');
-      // On browse pages (home/search/channel) leave the full YouTube UI intact
-      // so the user can navigate; only collapse to "video only" on watch pages.
-      if (!isWatchPage()) {
-        if (el && el.parentNode) el.parentNode.removeChild(el);
-        return;
-      }
-      if (!el) {
-        el = document.createElement('style');
-        el.id = '__u2s_player_only';
-        el.textContent = PLAYER_ONLY_CSS;
-      }
-      // Keep it last in <head> so it always wins the cascade, and re-attach if
-      // YouTube's renderer removed it.
-      var head = document.head || document.documentElement;
-      if (el.parentNode !== head || head.lastChild !== el) {
-        head.appendChild(el);
-      }
-    }
-    ensurePlayerOnlyStyle();
-    setInterval(function () {
-      ensurePlayerOnlyStyle();
-      var btn = document.querySelector(
-        '.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button'
-      );
-      if (btn) btn.click();
-      // Fast-forward through unskippable ads.
-      if (document.querySelector('.ad-showing, .ytp-ad-player-overlay')) {
-        var v = document.querySelector('video');
-        if (v && isFinite(v.duration) && v.duration > 0) {
-          try { v.currentTime = v.duration; } catch (e) {}
-        }
-      }
-      // Dismiss "are you still watching" / survey dialogs.
-      var dsm = document.querySelector('#dismiss-button button, .ytp-ad-overlay-close-button');
-      if (dsm) dsm.click();
-      // Turn subtitles/captions OFF by default (re-asserted every tick since
-      // YouTube may re-enable them on navigation / autoplay).
-      try {
-        var mp = document.getElementById('movie_player');
-        if (mp && mp.setOption) mp.setOption('captions', 'track', {});
-        if (mp && mp.unloadModule) mp.unloadModule('captions');
-      } catch (e) {}
-      // Enforce the target playback quality (set via window.__u2s_targetQuality
-      // from the UI). YouTube may downgrade on its own (ABR), so we re-assert it
-      // every tick. 'auto' means leave YouTube's ABR alone.
-      try {
-        var target = window.__u2s_targetQuality || 'highest';
-        if (target !== 'auto') {
-          var p = document.getElementById('movie_player');
-          if (p && p.getAvailableQualityLevels) {
-            var levels = p.getAvailableQualityLevels(); // highest -> lowest, no 'auto'
-            if (levels && levels.length) {
-              var order = ['highres','hd2160','hd1440','hd1080','hd720','large','medium','small','tiny'];
-              var pick;
-              if (target === 'highest') {
-                pick = levels[0];
-              } else {
-                var ti = order.indexOf(target);
-                // best available AT OR BELOW the target (levels is highest-first).
-                for (var i = 0; i < levels.length; i++) {
-                  if (order.indexOf(levels[i]) >= ti) { pick = levels[i]; break; }
-                }
-                if (!pick) pick = levels[levels.length - 1]; // only higher exist -> lowest available
-              }
-              if (pick) {
-                if (p.setPlaybackQualityRange) p.setPlaybackQualityRange(pick, pick);
-                if (p.setPlaybackQuality) p.setPlaybackQuality(pick);
-              }
-            }
-          }
-        }
-      } catch (e) {}
-    }, 400);
-    window.dispatchEvent(new Event('resize'));
-  })();
-`;
-
-// Returns the on-screen rectangle (CSS px, relative to the guest viewport) where
-// the video pixels are actually drawn. Our injected CSS makes the <video> fill
-// the whole viewport with object-fit:contain, so the drawn region is the video's
-// aspect ratio fitted inside the viewport. Capturing exactly this region (instead
-// of the whole webview pane) avoids double letterboxing. Null if no sized video.
-const VIDEO_RECT_JS = `
-  (function () {
-    var v = document.querySelector('video');
-    if (!v || !v.videoWidth || !v.videoHeight) return null;
-    var elW = window.innerWidth, elH = window.innerHeight;
-    if (!elW || !elH) return null;
-    var vAR = v.videoWidth / v.videoHeight, eAR = elW / elH;
-    var w, h;
-    if (vAR > eAR) { w = elW; h = elW / vAR; } else { h = elH; w = elH * vAR; }
-    return {
-      x: Math.round((elW - w) / 2), y: Math.round((elH - h) / 2),
-      width: Math.round(w), height: Math.round(h),
-      viewW: elW, viewH: elH
-    };
-  })()
-`;
+// ---- YouTube page treatment ---------------------------------------------------
 
 function setupYouTubeCleanup(guest: Electron.WebContents, ch: Channel) {
   const apply = () => {
+    if (guest.isDestroyed()) return;
     const url = guest.getURL();
     const isYouTube = /youtube\.com|youtu\.be/.test(url);
-    // Output black only on YouTube *browse* pages. Non-YouTube URLs (arbitrary
-    // video pages) are always captured; YouTube watch/shorts pages are captured.
-    ch.onWatchPage = !isYouTube || isWatchUrl(url);
+    // Black only on YouTube *browse* pages. Non-YouTube URLs (arbitrary video
+    // pages) and YouTube watch/shorts pages are projected.
+    ch.live = !isYouTube || isWatchUrl(url);
     ch.isYouTube = isYouTube;
-    // Force a fresh video-rect measurement for the new page.
-    ch.videoRect = null;
-    ch.videoRectStamp = 0;
+    ch.videoRect = null; // re-measured for the new page
+    pushState();
+    sendStatus();
     if (!isYouTube) return;
     // Seed the target quality before the injected interval starts reading it.
     pushQuality(ch);
-    // The persistent-<style> injector (AD_SKIP_JS) applies/removes the
-    // "video only" layout itself based on the live URL, so it self-heals across
-    // SPA navigations and never leaks onto browse pages. No eager insertCSS here.
-    guest.executeJavaScript(AD_SKIP_JS).catch((): void => {});
+    // The persistent-<style> injector applies/removes the "video only" layout
+    // itself based on the live URL, so it self-heals across SPA navigations.
+    guest.executeJavaScript(AD_SKIP_JS).catch((): void => undefined);
     // The previous page's key is invalid after navigation; re-insert if enabled.
     ch.hideCssKey = null;
     if (ch.hideControls) {
@@ -384,31 +188,69 @@ function setupYouTubeCleanup(guest: Electron.WebContents, ch: Channel) {
         .then((key) => {
           ch.hideCssKey = key;
         })
-        .catch((): void => {});
+        .catch((): void => undefined);
     }
   };
   guest.on('dom-ready', apply);
   // YouTube is a SPA; re-apply on in-page navigations too.
   guest.on('did-navigate-in-page', apply);
   guest.on('did-navigate', apply);
+  guest.on('destroyed', () => {
+    if (ch.guestContentsId === guest.id) {
+      ch.guestContentsId = null;
+      ch.live = false;
+      pushState();
+    }
+  });
 }
 
-// Push the channel's target quality into its guest. The injected interval reads
-// window.__u2s_targetQuality every tick and re-asserts it, so this takes effect
-// live (no reload) and survives ABR downgrades.
+// The injected interval reads window.__u2s_targetQuality every tick and
+// re-asserts it, so this takes effect live and survives ABR downgrades.
 function pushQuality(ch: Channel) {
-  if (ch.guestContentsId == null) return;
-  const guest = webContents.fromId(ch.guestContentsId);
-  if (!guest || guest.isDestroyed()) return;
-  guest
-    .executeJavaScript(
-      `window.__u2s_targetQuality=${JSON.stringify(ch.quality)};`,
-    )
-    .catch((): void => {});
+  guestOf(ch)
+    ?.executeJavaScript(`window.__u2s_targetQuality=${JSON.stringify(ch.quality)};`)
+    .catch((): void => undefined);
 }
+
+// Re-measure where the video is drawn in the guest. Only while projecting.
+function refreshVideoRect(ch: Channel) {
+  if (ch.rectBusy || !ch.live || !ch.isYouTube) return;
+  const guest = guestOf(ch);
+  if (!guest) return;
+  ch.rectBusy = true;
+  guest
+    .executeJavaScript(VIDEO_RECT_JS)
+    .then((r: VideoRect | null) => {
+      const next = r && r.width > 0 && r.height > 0 ? r : null;
+      if (JSON.stringify(next) !== JSON.stringify(ch.videoRect)) {
+        ch.videoRect = next;
+        pushState();
+      }
+    })
+    .catch((): void => undefined)
+    .finally(() => {
+      ch.rectBusy = false;
+    });
+}
+
+let rectTimer: NodeJS.Timeout | null = null;
+
+function syncRectPolling() {
+  const want = isProjectorOpen();
+  if (want && !rectTimer) {
+    rectTimer = setInterval(() => {
+      for (const id of CHANNELS) refreshVideoRect(channels[id]);
+    }, RECT_POLL_MS);
+  } else if (!want && rectTimer) {
+    clearInterval(rectTimer);
+    rectTimer = null;
+  }
+}
+
+// ---- Windows --------------------------------------------------------------------
 
 // Load the renderer bundle into `win`. `search` selects which root it mounts
-// ('' = the normal UI, 'gen=1' = the offscreen generative canvas).
+// ('' = the control UI, 'projector=1' = the projector).
 function loadRenderer(win: BrowserWindow, search = '') {
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
     const q = search ? `?${search}` : '';
@@ -425,599 +267,108 @@ const createWindow = () => {
   mainWindow = new BrowserWindow({
     width: 1680,
     height: 900,
+    title: 'Tube VJ',
+    backgroundColor: '#0b0b0c',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
-      // Enable the <webview> tag used to render YouTube etc.
       webviewTag: true,
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
-
-  // The hidden generative window and the projector are BrowserWindows too, so
-  // they would keep 'window-all-closed' from ever firing; tear them down with
-  // the UI.
+  // The projector is a BrowserWindow too, so it would keep
+  // 'window-all-closed' from ever firing; tear it down with the UI.
   mainWindow.on('closed', () => {
     mainWindow = null;
-    stopGen();
     closeProjector();
   });
-
   loadRenderer(mainWindow);
 };
 
-// ---- Capture loop (per channel) -------------------------------------------
+// ---- State -> projector / UI ----------------------------------------------------
 
-// Shared opaque-black BGRA frame, published while the guest is on a YouTube
-// browse page (so receivers never see the search/home UI, only real video).
-let blackFrame: Uint8Array | null = null;
-function getBlackFrame(): Uint8Array {
-  if (!blackFrame) {
-    blackFrame = new Uint8Array(OUT_W * OUT_H * 4);
-    for (let i = 3; i < blackFrame.length; i += 4) blackFrame[i] = 255; // alpha
-  }
-  return blackFrame;
-}
-
-let redFrame: Uint8Array | null = null;
-function getRedFrame(): Uint8Array {
-  // RGBA solid red (published via publishRGBA — no swizzle).
-  if (!redFrame) {
-    redFrame = new Uint8Array(OUT_W * OUT_H * 4);
-    for (let i = 0; i < redFrame.length; i += 4) {
-      redFrame[i] = 255; // R
-      redFrame[i + 3] = 255; // A
-    }
-  }
-  return redFrame;
-}
-
-// Route one finished OUT_W*OUT_H RGBA frame for a channel. In 'dual' mode it goes
-// straight to the channel's own Syphon server; in 'vj' mode it is just recorded
-// as ch.latest for the mixer (which publishes the blended result to one server).
-function outputChannelFrame(ch: Channel, frame: Uint8Array) {
-  ch.latest = frame;
-  projectFrame(ch.id, frame, OUT_W, OUT_H);
-  if (mode === 'dual') {
-    const t = performance.now();
-    if (ch.syphon.publishRGBA(frame, OUT_W, OUT_H)) countFrame(ch);
-    perfAdd(`${ch.id}.publish`, performance.now() - t);
-  }
-}
-
-// Composite a BGRA source image (srcW*srcH) centred, at 1:1, onto a black
-// OUT_W*OUT_H canvas, converting BGRA->RGBA in the SAME pass so the result is
-// ready to publish without a second full-buffer swizzle. The black bars are only
-// re-cleared when the video geometry changes (they are otherwise untouched from
-// the previous frame), so a steady-state frame does exactly one pass over just
-// the video pixels. Rows/cols are clamped so an unexpectedly large source (e.g.
-// a Retina scaleFactor slip) can never overrun the canvas.
-function letterbox(ch: Channel, src: Uint8Array, srcW: number, srcH: number): Uint8Array {
-  const size = OUT_W * OUT_H * 4;
-  let cleared = false;
-  if (!ch.frameBuf || ch.frameBuf.length < size) {
-    ch.frameBuf = new Uint8Array(size);
-    cleared = true; // fresh buffer needs its bars painted
-  }
-  const canvas = ch.frameBuf;
-
-  const w = Math.min(srcW, OUT_W);
-  const h = Math.min(srcH, OUT_H);
-  // Re-paint the opaque-black bars (RGBA 0,0,0,255) only when the video region
-  // changed shape; otherwise last frame's bars are already correct.
-  if (!cleared && (w !== ch.lbW || h !== ch.lbH)) cleared = true;
-  if (cleared) {
-    canvas.fill(0);
-    for (let i = 3; i < size; i += 4) canvas[i] = 255;
-    ch.lbW = w;
-    ch.lbH = h;
-  }
-
-  const offX = (OUT_W - w) >> 1;
-  const offY = (OUT_H - h) >> 1;
-  const srcStride = srcW * 4;
-  const dstStride = OUT_W * 4;
-  for (let y = 0; y < h; y++) {
-    let s = y * srcStride;
-    let d = (offY + y) * dstStride + offX * 4;
-    for (let x = 0; x < w; x++) {
-      canvas[d] = src[s + 2]; // R <- B
-      canvas[d + 1] = src[s + 1]; // G
-      canvas[d + 2] = src[s]; // B <- R
-      canvas[d + 3] = 255; // A (opaque; source alpha is always 255 here)
-      s += 4;
-      d += 4;
-    }
-  }
-  return canvas;
-}
-
-// Process ONE painted frame delivered by beginFrameSubscription. `image` is the
-// full webview surface; we crop to the drawn-video rect (avoids double
-// letterboxing), scale-to-fit + letterbox onto 1920x1080, and publish. Fully
-// synchronous — no capturePage round-trip, so it runs at the compositor's paint
-// cadence instead of stalling on polled GPU readbacks.
-function onFrame(ch: Channel, image: Electron.NativeImage) {
-  // Static modes (test pattern / browsing) are driven by the slow timer so they
-  // work even when the page isn't painting; ignore live paints for them.
-  if (ch.testFrame || !ch.onWatchPage) return;
-  const t0 = performance.now();
-  try {
-    if (image.isEmpty()) return;
-
-    // On YouTube our CSS makes the <video> fill the viewport (object-fit:contain),
-    // so crop to ONLY the drawn video rectangle (measured off-thread, cached on
-    // ch.videoRect). Clamp to the surface bounds so a stale rect can't overrun.
-    let img = image;
-    const full = image.getSize();
-    const rect = ch.isYouTube ? ch.videoRect : null;
-    if (rect && rect.viewW > 0 && rect.viewH > 0) {
-      // The subscription image is in device px (Retina => 2x the CSS px the rect
-      // was measured in). Rescale the rect by the image/viewport ratio so the crop
-      // lands on the real video region, not a corner of it.
-      const sx = full.width / rect.viewW;
-      const sy = full.height / rect.viewH;
-      const x = Math.max(0, Math.min(Math.round(rect.x * sx), full.width - 1));
-      const y = Math.max(0, Math.min(Math.round(rect.y * sy), full.height - 1));
-      const w = Math.max(1, Math.min(Math.round(rect.width * sx), full.width - x));
-      const h = Math.max(1, Math.min(Math.round(rect.height * sy), full.height - y));
-      img = image.crop({ x, y, width: w, height: h });
-    }
-
-    // Scale UNIFORMLY to fit within OUT_W x OUT_H, preserving aspect ratio, then
-    // letterbox onto the fixed 1920x1080 canvas (keeps every video at correct
-    // proportions regardless of the source's aspect).
-    const src = img.getSize();
-    if (src.width <= 0 || src.height <= 0) return;
-    const scale = Math.min(OUT_W / src.width, OUT_H / src.height);
-    const dw = Math.max(1, Math.round(src.width * scale));
-    const dh = Math.max(1, Math.round(src.height * scale));
-    const resized = img.resize({ width: dw, height: dh, quality: 'good' });
-    // toBitmap() returns BGRA. Force scaleFactor 1.0 so the buffer is exactly
-    // dw*dh px regardless of the display's Retina scale factor.
-    const bgra = resized.toBitmap({ scaleFactor: 1.0 });
-    perfAdd(`${ch.id}.native`, performance.now() - t0); // crop+resize+toBitmap
-    // Guard against a scaleFactor slip: derive the true pixel size from length.
-    const px = bgra.length / 4;
-    let bw = dw;
-    let bh = dh;
-    if (px !== dw * dh && dw > 0) {
-      const k = Math.round(Math.sqrt(px / (dw * dh)));
-      if (k > 1) {
-        bw = dw * k;
-        bh = dh * k;
-      }
-    }
-    const tl = performance.now();
-    const frame = letterbox(ch, bgra, bw, bh);
-    perfAdd(`${ch.id}.letterbox`, performance.now() - tl);
-    outputChannelFrame(ch, frame);
-  } catch (err) {
-    sendStatus({ error: err instanceof Error ? err.message : String(err) });
-  } finally {
-    countCapture(ch, performance.now() - t0);
-  }
-}
-
-// Per-second capture diagnostics: how many frames the subscription delivered
-// and how long the main thread spent on each (crop/resize/letterbox/publish).
-// A low captureFps with a small frameMs means frames are not arriving; a high
-// frameMs means the processing itself is the bottleneck.
-function countCapture(ch: Channel, ms: number) {
-  perfAdd(`${ch.id}.frame`, ms);
-  ch.capThisSecond++;
-  ch.capMsThisSecond += ms;
-  const now = Date.now();
-  if (now - ch.capStamp >= 1000) {
-    ch.captureFps = ch.capThisSecond;
-    ch.frameMs = ch.capThisSecond ? ch.capMsThisSecond / ch.capThisSecond : 0;
-    ch.capThisSecond = 0;
-    ch.capMsThisSecond = 0;
-    ch.capStamp = now;
-  }
-}
-
-// Slow timer (~STATIC_TICK_MS): publishes the generated static frames (red test
-// pattern, black while browsing) which have no paints to ride on, and refreshes
-// the cached drawn-video rect off-thread for the frame-subscription path.
-function staticTick(ch: Channel) {
-  if (ch.testFrame) {
-    outputChannelFrame(ch, getRedFrame());
-    return;
-  }
-  if (!ch.onWatchPage) {
-    outputChannelFrame(ch, getBlackFrame());
-    return;
-  }
-  // Watch page: live frames arrive via onFrame(); just keep the rect fresh.
-  if (ch.isYouTube) refreshVideoRect(ch);
-}
-
-// Measure the drawn-video rect in the guest (throttled ~2x/sec) and cache it for
-// onFrame() to crop with. Fire-and-forget so it never blocks a paint.
-function refreshVideoRect(ch: Channel) {
-  const now = Date.now();
-  if (ch.rectRefreshing || (ch.videoRect && now - ch.videoRectStamp < 500)) return;
-  if (ch.guestContentsId == null) return;
-  const guest = webContents.fromId(ch.guestContentsId);
-  if (!guest || guest.isDestroyed()) return;
-  ch.rectRefreshing = true;
-  ch.videoRectStamp = now;
-  guest
-    .executeJavaScript(VIDEO_RECT_JS)
-    .then((r: Channel['videoRect']) => {
-      ch.videoRect = r && r.width > 0 && r.height > 0 ? r : null;
-    })
-    .catch(() => {
-      /* keep the previous rect */
-    })
-    .finally(() => {
-      ch.rectRefreshing = false;
-    });
-}
-
-// ---- Frame subscription (per channel) -------------------------------------
-
-function subscribeGuest(ch: Channel) {
-  if (ch.guestContentsId == null) return;
-  if (ch.subscribedContentsId === ch.guestContentsId) return;
-  unsubscribeGuest(ch); // drop any stale subscription first
-  const guest = webContents.fromId(ch.guestContentsId);
-  if (!guest || guest.isDestroyed()) return;
-  try {
-    // onlyDirty=false: deliver full frames so a crop always has complete pixels.
-    guest.beginFrameSubscription(false, (image) => onFrame(ch, image));
-    ch.subscribedContentsId = ch.guestContentsId;
-  } catch (err) {
-    sendStatus({ error: err instanceof Error ? err.message : String(err) });
-  }
-}
-
-function unsubscribeGuest(ch: Channel) {
-  if (ch.subscribedContentsId == null) return;
-  const guest = webContents.fromId(ch.subscribedContentsId);
-  try {
-    guest?.endFrameSubscription();
-  } catch {
-    /* guest already gone */
-  }
-  ch.subscribedContentsId = null;
-}
-
-function countFrame(ch: Channel) {
-  ch.framesThisSecond++;
-  const now = Date.now();
-  if (now - ch.lastFpsStamp >= 1000) {
-    ch.measuredFps = ch.framesThisSecond;
-    ch.framesThisSecond = 0;
-    ch.lastFpsStamp = now;
-    sendStatus({});
-  }
-}
-
-// ---- VJ mixer -------------------------------------------------------------
-
-function countVjFrame() {
-  vjFramesThisSecond++;
-  const now = Date.now();
-  if (now - vjLastFpsStamp >= 1000) {
-    vjMeasuredFps = vjFramesThisSecond;
-    vjFramesThisSecond = 0;
-    vjLastFpsStamp = now;
-    sendStatus({});
-  }
-}
-
-// Blend two OUT_W*OUT_H RGBA frames into dst: dst = a*(1-t) + b*t.
-function blend(dst: Uint8Array, a: Uint8Array, b: Uint8Array, t: number) {
-  const it = 1 - t;
-  const n = OUT_W * OUT_H * 4;
-  for (let i = 0; i < n; i++) {
-    dst[i] = (a[i] * it + b[i] * t) | 0;
-  }
-}
-
-// Publish one mixed frame. Skips the per-pixel blend entirely at the fader ends
-// (the common "hold on A/B" case) — only a live crossfade pays the blend cost.
-function vjTick() {
-  // Advance an in-progress crossfade animation (smoothstep for an ease-in/out
-  // "slow" feel). Manual fader input cancels it (see set-vj-alpha).
-  if (vjAnim) {
-    const t = Math.min(1, (Date.now() - vjAnim.start) / vjAnim.dur);
-    const e = t * t * (3 - 2 * t); // smoothstep
-    vjAlpha = vjAnim.from + (vjAnim.to - vjAnim.from) * e;
-    if (t >= 1) {
-      vjAlpha = vjAnim.to;
-      vjAnim = null;
-    }
-    sendStatus({}); // keep the UI fader in sync during the fade
-  }
-
-  const tTick = performance.now();
-  const black = getBlackFrame();
-  const L = channels.left.latest ?? black;
-  const R = channels.right.latest ?? black;
-  let out: Uint8Array;
-  if (vjAlpha <= 0.001) {
-    out = L;
-  } else if (vjAlpha >= 0.999) {
-    out = R;
-  } else {
-    if (!vjBuf || vjBuf.length < OUT_W * OUT_H * 4) {
-      vjBuf = new Uint8Array(OUT_W * OUT_H * 4);
-    }
-    const tb = performance.now();
-    blend(vjBuf, L, R, vjAlpha);
-    perfAdd('vj.blend', performance.now() - tb);
-    out = vjBuf;
-  }
-  const tp = performance.now();
-  if (vjSyphon.publishRGBA(out, OUT_W, OUT_H)) countVjFrame();
-  perfAdd('vj.publish', performance.now() - tp);
-  projectFrame('vj', out, OUT_W, OUT_H);
-  perfAdd('vj.tick', performance.now() - tTick);
-}
-
-function startVjTimer() {
-  if (vjTimer) return;
-  vjLastFpsStamp = Date.now();
-  vjFramesThisSecond = 0;
-  vjTimer = setInterval(vjTick, VJ_INTERVAL_MS);
-}
-
-function stopVjTimer() {
-  if (vjTimer) {
-    clearInterval(vjTimer);
-    vjTimer = null;
-  }
-  vjMeasuredFps = 0;
-}
-
-// ---- 汎用 (generic) generative output --------------------------------------
-
-function countGenFrame() {
-  genFramesThisSecond++;
-  const now = Date.now();
-  if (now - genLastFpsStamp >= 1000) {
-    genMeasuredFps = genFramesThisSecond;
-    genFramesThisSecond = 0;
-    genLastFpsStamp = now;
-    sendStatus({});
-  }
-}
-
-// Push the current params into the offscreen window (and mirror them to the UI
-// so its preview draws exactly the same thing).
-function pushGenParams() {
-  genWindow?.webContents.send('app:gen-params', genParams);
-  sendToProjector('app:gen-params', genParams);
-}
-
-function createGenWindow() {
-  if (genWindow && !genWindow.isDestroyed()) return;
-  genWindow = new BrowserWindow({
-    width: OUT_W,
-    height: OUT_H,
-    show: false,
-    frame: false,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      offscreen: true,
-      // The window is never visible, so Chromium would otherwise throttle
-      // requestAnimationFrame down to a crawl and the output would stutter.
-      backgroundThrottling: false,
-    },
+function projectorState(): ProjectorState {
+  const deck = (ch: Channel) => ({
+    guestId: ch.guestContentsId,
+    live: ch.live,
+    rect: ch.isYouTube ? ch.videoRect : null,
   });
-  const wc = genWindow.webContents;
-  wc.setFrameRate(GEN_FPS);
-  // Electron has changed this event's argument list across versions (dirty-rect
-  // + image vs. a details object), so pick the NativeImage out of whatever
-  // arrives instead of relying on a fixed position.
-  wc.on('paint', (...args: unknown[]) => {
-    const image = args.find(
-      (a): a is Electron.NativeImage =>
-        !!a && typeof (a as Electron.NativeImage).getBitmap === 'function',
-    );
-    if (image) onGenPaint(image);
-  });
-  wc.on('did-finish-load', pushGenParams);
-  genWindow.on('closed', () => {
-    genWindow = null;
-  });
-  loadRenderer(genWindow, 'gen=1');
-}
-
-function onGenPaint(image: Electron.NativeImage) {
-  // Independent of the player routing: paints publish whenever the generative
-  // server is up.
-  if (!genSyphon.isRunning) return;
-  try {
-    if (image.isEmpty()) return;
-    const size = image.getSize();
-    // getBitmap() hands back the underlying BGRA pixels with no copy (unlike
-    // toBitmap()), which matters at 1080p60 — we publish synchronously here, so
-    // the "don't hold on to it" caveat is satisfied. Cast: Electron's own .d.ts
-    // mistypes the return as void.
-    const bgra = (image as unknown as { getBitmap(): Buffer }).getBitmap();
-    // Guard against a scale-factor slip (the bitmap can come back at 2x the
-    // logical size): derive the true pixel dimensions from the buffer length.
-    let w = size.width;
-    let h = size.height;
-    const px = bgra.length / 4;
-    if (w > 0 && h > 0 && px !== w * h) {
-      const k = Math.round(Math.sqrt(px / (w * h)));
-      if (k > 1) {
-        w *= k;
-        h *= k;
-      }
-    }
-    if (w <= 0 || h <= 0 || bgra.length < w * h * 4) return;
-    const tg = performance.now();
-    if (genSyphon.publishBGRA(bgra, w, h)) countGenFrame();
-    perfAdd('gen.publish', performance.now() - tg);
-  } catch (err) {
-    sendStatus({ error: err instanceof Error ? err.message : String(err) });
-  }
-}
-
-function startGen(): { ok: boolean; error?: string } {
-  if (!genSyphon.start()) {
-    return { ok: false, error: genSyphon.error ?? 'gen start failed' };
-  }
-  genLastFpsStamp = Date.now();
-  genFramesThisSecond = 0;
-  createGenWindow();
-  pushGenParams();
-  return { ok: true };
-}
-
-function stopGen() {
-  if (genWindow && !genWindow.isDestroyed()) genWindow.destroy();
-  genWindow = null;
-  genSyphon.dispose();
-  genMeasuredFps = 0;
-}
-
-// Switch between 'dual' and 'vj'. Entering VJ stops the per-channel servers,
-// starts the single mixed server, and makes sure both channels are capturing.
-// Leaving VJ tears the mixer down and stops capture (dual outputs start on demand).
-/**
- * Switch how the two players are routed. This only owns the *player* outputs —
- * the generative output is independent and is not touched here, so 汎用 can be
- * publishing its own Syphon server while the players run in either mode
- * (Dual + 汎用 = three simultaneous sources).
- */
-function setMode(next: Mode): { ok: boolean; error?: string } {
-  if (next === mode) return { ok: true };
-
-  // Tear the previous routing down: the per-channel servers and the mixer are
-  // mutually exclusive with each other.
-  stopVjTimer();
-  vjSyphon.dispose();
-  for (const ch of Object.values(channels)) {
-    stopCapture(ch);
-    ch.syphon.dispose();
-  }
-
-  if (next === 'vj') {
-    if (!vjSyphon.start()) {
-      return { ok: false, error: vjSyphon.error ?? 'vj start failed' };
-    }
-    mode = 'vj';
-    for (const ch of Object.values(channels)) startCapture(ch);
-    startVjTimer();
-  } else {
-    // Dual: per-channel outputs start on demand via "Start output".
-    mode = 'dual';
-    syncCapture(); // ...but a projected player keeps capturing
-  }
-  sendStatus({});
-  return { ok: true };
-}
-
-/**
- * Run each player's capture exactly when something consumes its frames: its
- * own Syphon/Spout output, the VJ mixer, or the projector showing it. The
- * projector alone is enough, so a player can be projected without publishing.
- *
- * Likewise the mixer runs in VJ mode, or in Dual mode while the projector shows
- * the VJ mix — then the fader drives only the projector (vjSyphon is not
- * started, so the mix is not published) and both Dual outputs are unaffected.
- */
-function syncCapture() {
-  const projected = activeProjectorSource();
-  const mixing = mode === 'vj' || projected === 'vj';
-  for (const ch of Object.values(channels)) {
-    const needed = mixing || ch.syphon.isRunning || projected === ch.id;
-    if (needed) startCapture(ch);
-    else stopCapture(ch);
-  }
-  if (mixing) startVjTimer();
-  else stopVjTimer();
-}
-
-function startCapture(ch: Channel) {
-  if (ch.captureTimer) return;
-  ch.lastFpsStamp = Date.now();
-  ch.framesThisSecond = 0;
-  // Live frames come from the frame subscription; the timer only drives static
-  // frames + rect refresh.
-  ch.captureTimer = setInterval(() => staticTick(ch), STATIC_TICK_MS);
-  subscribeGuest(ch);
-}
-
-function stopCapture(ch: Channel) {
-  if (ch.captureTimer) {
-    clearInterval(ch.captureTimer);
-    ch.captureTimer = null;
-  }
-  unsubscribeGuest(ch);
-  ch.measuredFps = 0;
-}
-
-// ---- Status -> renderer ---------------------------------------------------
-
-function channelStatus(ch: Channel) {
   return {
-    running: ch.syphon.isRunning,
-    capturing: ch.captureTimer !== null,
-    hasClients: ch.syphon.hasClients,
-    fps: ch.measuredFps,
-    // Stale when frames stop arriving: report 0 instead of the last figures.
-    captureFps: Date.now() - ch.capStamp > 2000 ? 0 : ch.captureFps,
-    frameMs: Date.now() - ch.capStamp > 2000 ? 0 : Math.round(ch.frameMs * 10) / 10,
-    serverName: ch.serverName,
-    error: ch.syphon.error,
-    testFrame: ch.testFrame,
-    hideControls: ch.hideControls,
-    quality: ch.quality,
+    decks: { left: deck(channels.left), right: deck(channels.right) },
+    alpha,
+    anim,
+    output,
   };
 }
 
-function appStatus() {
+function pushState() {
+  sendProjectorState(projectorState());
+}
+
+function deckStatus(ch: Channel): DeckStatus {
+  return { live: ch.live, hideControls: ch.hideControls, quality: ch.quality };
+}
+
+function appStatus(): AppStatus {
   return {
-    left: channelStatus(channels.left),
-    right: channelStatus(channels.right),
-    protocol: OUTPUT_PROTOCOL,
+    left: deckStatus(channels.left),
+    right: deckStatus(channels.right),
+    alpha: currentAlpha(),
+    fading: anim !== null,
     projector: projectorStatus(),
-    mode,
-    vjAlpha,
-    vj: {
-      running: vjSyphon.isRunning,
-      hasClients: vjSyphon.hasClients,
-      fps: vjMeasuredFps,
-      serverName: 'TubeToSyphon',
-      error: vjSyphon.error,
-    },
-    gen: {
-      running: genSyphon.isRunning,
-      hasClients: genSyphon.hasClients,
-      fps: genMeasuredFps,
-      serverName: 'TubeToSyphon-GEN',
-      error: genSyphon.error,
-    },
-    genParams,
+    output,
   };
 }
 
-function sendStatus(extra: { error?: string }) {
-  const status = appStatus();
-  if (extra.error) {
-    status.left = { ...status.left, error: extra.error };
-    status.right = { ...status.right, error: extra.error };
-  }
+function sendStatus() {
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('app:status', status);
+    mainWindow.webContents.send('app:status', appStatus());
   }
 }
 
-// ---- IPC ------------------------------------------------------------------
+function setAlpha(a: number) {
+  stopFade();
+  alpha = Math.min(1, Math.max(0, a));
+  pushState();
+  sendStatus();
+}
 
-// Renderer tells us which webContents id belongs to which channel (it reads
-// <webview>.getWebContentsId() on dom-ready). This avoids relying on the order
-// of did-attach-webview events.
+function stopFade() {
+  if (anim) alpha = currentAlpha(); // freeze where the fade got to
+  anim = null;
+  if (fadeTimer) {
+    clearInterval(fadeTimer);
+    fadeTimer = null;
+  }
+}
+
+function fadeTo(target: number, durationMs: number) {
+  const to = Math.min(1, Math.max(0, target));
+  if (!(durationMs > 0)) {
+    setAlpha(to);
+    return;
+  }
+  const from = currentAlpha();
+  stopFade();
+  alpha = to; // the resting value once the fade completes
+  anim = { from, to, start: Date.now(), dur: durationMs };
+  pushState(); // the projector animates this itself, frame-accurately
+  fadeTimer = setInterval(() => {
+    if (anim && Date.now() >= anim.start + anim.dur) {
+      anim = null;
+      clearInterval(fadeTimer!);
+      fadeTimer = null;
+      pushState();
+    }
+    sendStatus(); // only keeps the UI fader moving
+  }, FADE_UI_MS);
+  sendStatus();
+}
+
+// ---- IPC: control UI ---------------------------------------------------------------
+
+// The renderer tells us which webContents id belongs to which deck (it reads
+// <webview>.getWebContentsId() on dom-ready).
 ipcMain.handle(
   'app:register-guest',
   (_e, channelId: ChannelId, contentsId: number) => {
@@ -1028,149 +379,72 @@ ipcMain.handle(
     if (!guest || guest.isDestroyed()) return { ok: false };
     ch.guestContentsId = contentsId;
     setupYouTubeCleanup(guest, ch);
-    // If capture is already running, (re)attach the frame subscription to the
-    // new guest webContents.
-    if (ch.captureTimer) subscribeGuest(ch);
+    pushState(); // the projector re-acquires the new guest
     return { ok: true };
   },
 );
-
-ipcMain.handle('app:start-output', (_e, channelId: ChannelId) => {
-  const ch = getChannel(channelId);
-  if (!ch) return { ok: false, error: 'unknown channel' };
-  if (mode === 'vj') return { ok: false, error: 'switch to Dual mode first' };
-  if (!ch.syphon.start()) {
-    return { ok: false, error: ch.syphon.error };
-  }
-  startCapture(ch);
-  sendStatus({});
-  return { ok: true };
-});
-
-ipcMain.handle('app:stop-output', (_e, channelId: ChannelId) => {
-  const ch = getChannel(channelId);
-  if (!ch) return { ok: false, error: 'unknown channel' };
-  ch.syphon.dispose();
-  syncCapture(); // keeps capturing if the projector still shows this player
-  sendStatus({});
-  return { ok: true };
-});
-
-ipcMain.handle('app:test-frame', (_e, channelId: ChannelId, on: boolean) => {
-  const ch = getChannel(channelId);
-  if (!ch) return { ok: false, error: 'unknown channel' };
-  ch.testFrame = on;
-  if (on && !ch.syphon.start()) return { ok: false, error: ch.syphon.error };
-  if (on) startCapture(ch);
-  sendStatus({});
-  return { ok: true };
-});
 
 ipcMain.handle(
   'app:set-hide-controls',
   async (_e, channelId: ChannelId, on: boolean) => {
     const ch = getChannel(channelId);
     if (!ch) return { ok: false, error: 'unknown channel' };
-    ch.hideControls = on;
-    const guest =
-      ch.guestContentsId != null ? webContents.fromId(ch.guestContentsId) : null;
-    if (guest && !guest.isDestroyed()) {
+    ch.hideControls = !!on;
+    const guest = guestOf(ch);
+    if (guest) {
       if (ch.hideCssKey) {
-        try {
-          await guest.removeInsertedCSS(ch.hideCssKey);
-        } catch {
-          /* stale key after navigation — ignore */
-        }
+        await guest.removeInsertedCSS(ch.hideCssKey).catch((): void => undefined);
         ch.hideCssKey = null;
       }
-      if (on) {
-        try {
-          ch.hideCssKey = await guest.insertCSS(CHROME_HIDE_CSS);
-        } catch {
-          /* ignore */
-        }
+      if (ch.hideControls) {
+        ch.hideCssKey = await guest.insertCSS(CHROME_HIDE_CSS).catch((): null => null);
       }
     }
-    sendStatus({});
+    sendStatus();
     return { ok: true };
   },
 );
 
-ipcMain.handle(
-  'app:set-quality',
-  (_e, channelId: ChannelId, quality: Quality) => {
-    const ch = getChannel(channelId);
-    if (!ch) return { ok: false, error: 'unknown channel' };
-    ch.quality = quality;
-    pushQuality(ch); // takes effect live; the injected interval re-asserts it
-    sendStatus({});
-    return { ok: true };
-  },
-);
-
-ipcMain.handle('app:set-mode', (_e, next: Mode) => {
-  if (next !== 'dual' && next !== 'vj') return { ok: false, error: 'bad mode' };
-  return setMode(next);
-});
-
-// The generative output runs independently of the player routing, so it gets
-// its own start/stop rather than being implied by a mode.
-ipcMain.handle('app:set-gen-output', (_e, on: boolean) => {
-  if (on) return startGen();
-  stopGen();
-  sendStatus({});
+ipcMain.handle('app:set-quality', (_e, channelId: ChannelId, quality: Quality) => {
+  const ch = getChannel(channelId);
+  if (!ch) return { ok: false, error: 'unknown channel' };
+  ch.quality = quality;
+  pushQuality(ch);
+  sendStatus();
   return { ok: true };
 });
 
-// Update the generative params (partial patch: the UI sends only what changed).
-ipcMain.handle('app:set-gen-params', (_e, patch: Partial<GenParams>) => {
-  if (!patch || typeof patch !== 'object') {
-    return { ok: false, error: 'bad params' };
-  }
-  genParams = clampGenParams(patch, genParams);
-  pushGenParams();
-  sendStatus({});
+ipcMain.handle('app:set-alpha', (_e, a: number) => {
+  if (typeof a !== 'number' || !isFinite(a)) return { ok: false, error: 'bad alpha' };
+  setAlpha(a);
   return { ok: true };
 });
 
-ipcMain.handle('app:set-vj-alpha', (_e, alpha: number) => {
-  if (typeof alpha !== 'number' || !isFinite(alpha)) {
-    return { ok: false, error: 'bad alpha' };
-  }
-  vjAnim = null; // manual fader wins; cancel any running fade
-  vjAlpha = Math.min(1, Math.max(0, alpha));
-  sendStatus({});
-  return { ok: true };
-});
-
-// Animate the crossfade to `target` over `durationMs` (Cut A/B use ~1s).
-ipcMain.handle('app:vj-fade', (_e, target: number, durationMs: number) => {
+ipcMain.handle('app:fade', (_e, target: number, durationMs: number) => {
   if (typeof target !== 'number' || !isFinite(target)) {
     return { ok: false, error: 'bad target' };
   }
-  const to = Math.min(1, Math.max(0, target));
-  const dur = typeof durationMs === 'number' && durationMs > 0 ? durationMs : 0;
-  if (dur === 0) {
-    vjAnim = null;
-    vjAlpha = to;
-  } else {
-    vjAnim = { from: vjAlpha, to, start: Date.now(), dur };
-  }
-  sendStatus({});
+  fadeTo(target, typeof durationMs === 'number' ? durationMs : 0);
+  return { ok: true };
+});
+
+ipcMain.handle('app:set-output', (_e, patch: Partial<OutputSettings>) => {
+  output = clampOutput(patch, output);
+  fs.promises
+    .writeFile(settingsFile(), JSON.stringify(output))
+    .catch((): void => undefined);
+  pushState();
+  sendStatus();
   return { ok: true };
 });
 
 ipcMain.handle('app:get-status', () => appStatus());
 
-// ---- Google login ---------------------------------------------------------
+// ---- IPC: Google login ---------------------------------------------------------------
 
 // Reload both player guests so they pick up the changed session cookies.
 function reloadGuests() {
-  for (const ch of Object.values(channels)) {
-    if (ch.guestContentsId == null) continue;
-    const guest = webContents.fromId(ch.guestContentsId);
-    if (guest && !guest.isDestroyed()) guest.reload();
-  }
+  for (const id of CHANNELS) guestOf(channels[id])?.reload();
 }
 
 function sendLoginState(state: LoginState) {
@@ -1196,66 +470,81 @@ ipcMain.handle('app:google-logout', async () => {
 
 ipcMain.handle('app:get-login-state', () => getLoginState());
 
-// ---- Projector --------------------------------------------------------------
+// ---- IPC: projector ----------------------------------------------------------------
+
+function onProjectorChanged() {
+  syncRectPolling();
+  for (const id of CHANNELS) refreshVideoRect(channels[id]);
+  sendStatus();
+}
 
 ipcMain.handle('app:projector-open', (_e, displayId: number) => {
-  const res = openProjector(displayId, loadRenderer, () => {
-    syncCapture();
-    sendStatus({});
-  });
-  syncCapture();
-  sendStatus({});
+  const res = openProjector(displayId, loadRenderer, onProjectorChanged);
+  onProjectorChanged();
   return res;
 });
 
 ipcMain.handle('app:projector-close', () => {
   closeProjector();
-  syncCapture();
-  sendStatus({});
+  onProjectorChanged();
   return { ok: true };
 });
 
-ipcMain.handle('app:projector-set-source', (_e, next: ProjectorSource) => {
-  if (!['left', 'right', 'vj', 'gen'].includes(next)) {
-    return { ok: false, error: 'bad source' };
+// Called by the projector window itself.
+ipcMain.handle('app:projector-get-state', () => projectorState());
+
+// A one-shot media source id that lets the *calling* window (the projector)
+// capture a deck's guest with getUserMedia({ chromeMediaSource: 'tab' }).
+ipcMain.handle('app:projector-source-id', (e, channelId: ChannelId) => {
+  const ch = getChannel(channelId);
+  const guest = ch ? guestOf(ch) : null;
+  if (!guest) return null;
+  try {
+    return guest.getMediaSourceId(e.sender);
+  } catch {
+    return null;
   }
-  setProjectorSource(next);
-  syncCapture();
-  sendStatus({});
-  return { ok: true };
 });
 
-ipcMain.on('app:projector-frame-done', () => {
-  if (projectorFrameDone()) sendStatus({});
+ipcMain.on('app:projector-stats', (_e, stats: ProjectorStats) => {
+  if (setProjectorStats(stats)) sendStatus();
 });
 
-// Packaged-build smoke test (used by CI): U2S_SELFTEST=1 starts one output,
-// publishes a single red frame through the platform output (Syphon/Spout),
-// prints the result as JSON and exits — no window is opened.
+// ---- Startup ---------------------------------------------------------------------
+
+// Packaged-build smoke test (CI): U2S_SELFTEST=1 loads the UI and checks that
+// tab-capture source ids can be issued, prints the result as JSON and exits.
 function runSelfTest() {
-  const out = createOutput('TubeToSyphon-SelfTest');
-  const started = out.start();
-  const published = started && out.publishRGBA(getRedFrame(), OUT_W, OUT_H);
-  console.log(
-    `U2S_SELFTEST ${JSON.stringify({
-      protocol: OUTPUT_PROTOCOL,
-      packaged: app.isPackaged,
-      started,
-      published,
-      error: out.error,
-    })}`,
-  );
-  out.dispose();
-  app.exit(started && published ? 0 : 1);
+  createWindow();
+  const win = mainWindow!;
+  win.webContents.once('did-finish-load', () => {
+    const probe = new BrowserWindow({ show: false });
+    probe
+      .loadURL('data:text/html,<p>probe</p>')
+      .then(() => {
+        const id = probe.webContents.getMediaSourceId(win.webContents);
+        const ok = typeof id === 'string' && id.length > 0;
+        console.log(
+          `U2S_SELFTEST ${JSON.stringify({ packaged: app.isPackaged, sourceId: ok })}`,
+        );
+        app.exit(ok ? 0 : 1);
+      })
+      .catch((err) => {
+        console.log(`U2S_SELFTEST ${JSON.stringify({ error: String(err) })}`);
+        app.exit(1);
+      });
+  });
 }
 
 app.on('ready', () => {
+  output = loadOutput();
   if (process.env.U2S_SELFTEST === '1') {
     runSelfTest();
     return;
   }
   installLoginHeaderFilter();
   createWindow();
+  setPerfExtra(() => ({ projector: projectorStatus().stats }));
   startPerf(); // no-op unless U2S_PERF=1
   if (process.env.U2S_BENCH === 'vjproj' && mainWindow) {
     runBench(mainWindow).catch((err) => {
@@ -1264,22 +553,17 @@ app.on('ready', () => {
     });
   }
   // Keep the display list current, and drop the projector if it is unplugged.
-  screen.on('display-added', () => sendStatus({}));
+  screen.on('display-added', () => sendStatus());
   screen.on('display-removed', (_e, d) => {
     handleDisplayRemoved(d.id);
-    syncCapture();
-    sendStatus({});
+    onProjectorChanged();
   });
 });
 
 app.on('window-all-closed', () => {
-  stopVjTimer();
-  vjSyphon.dispose();
-  stopGen();
-  for (const ch of Object.values(channels)) {
-    stopCapture(ch);
-    ch.syphon.dispose();
-  }
+  stopFade();
+  if (rectTimer) clearInterval(rectTimer);
+  rectTimer = null;
   if (process.platform !== 'darwin') {
     app.quit();
   }

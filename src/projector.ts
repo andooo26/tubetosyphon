@@ -1,49 +1,27 @@
 import { BrowserWindow, screen } from 'electron';
 import path from 'node:path';
-import { perfAdd } from './perf';
+import {
+  EMPTY_DECK_STATS,
+  type DisplayInfo,
+  type ProjectorState,
+  type ProjectorStats,
+  type ProjectorStatus,
+} from './shared';
 
 // ---- Projector output -----------------------------------------------------
-// A frameless fullscreen window on a chosen display (projector) that shows one
-// of the outputs: A / B / the VJ mix, or the generative sketch.
+// A frameless fullscreen window on a chosen display: the app's output.
 //
-// A / B / VJ frames are the same finished RGBA buffers that go to Syphon/Spout;
-// main pushes them over IPC (~2.5ms per 1080p frame) and the window draws them
-// with WebGL. Flow control: at most one frame in flight — frames that arrive
-// while the window is still drawing are dropped, so a slow projector window
-// never builds up an IPC backlog.
-//
-// The generative source needs no frames at all: the window renders the same
-// GenCanvas (same params + wall clock) itself, like the UI preview does.
-
-export type ProjectorSource = 'left' | 'right' | 'vj' | 'gen';
-
-export interface DisplayInfo {
-  id: number;
-  label: string;
-  width: number;
-  height: number;
-  primary: boolean;
-}
-
-export interface ProjectorStatus {
-  open: boolean;
-  displayId: number | null;
-  source: ProjectorSource;
-  fps: number; // frames actually drawn by the projector window (A / B / VJ)
-  displays: DisplayInfo[];
-}
+// No pixels pass through the main process. The window captures both player
+// <webview>s itself with Chromium's tab capture (getUserMedia with a media
+// source id from webContents.getMediaSourceId) and crossfades the two live
+// <video>s with CSS opacity, so capture, scaling and mixing all stay on the
+// GPU/compositor. Main only pushes the small ProjectorState (which guests,
+// crop rects, fader) and receives fps figures back.
 
 let win: BrowserWindow | null = null;
 let displayId: number | null = null;
-let source: ProjectorSource = 'left';
-let inFlight = false;
-let inFlightSince = 0;
-// A lost ack (e.g. the window reloaded mid-frame) must not stall the feed.
-const ACK_TIMEOUT_MS = 500;
-
-let framesThisSecond = 0;
-let lastFpsStamp = Date.now();
-let measuredFps = 0;
+let stats: ProjectorStats = { left: EMPTY_DECK_STATS, right: EMPTY_DECK_STATS };
+let statsStamp = 0;
 
 export function listDisplays(): DisplayInfo[] {
   const primaryId = screen.getPrimaryDisplay().id;
@@ -56,14 +34,23 @@ export function listDisplays(): DisplayInfo[] {
   }));
 }
 
+export function isProjectorOpen(): boolean {
+  return !!win && !win.isDestroyed();
+}
+
+export function projectorContents(): Electron.WebContents | null {
+  return win && !win.isDestroyed() ? win.webContents : null;
+}
+
 export function projectorStatus(): ProjectorStatus {
+  const open = isProjectorOpen();
+  // No report for a while = the window is gone or stuck: don't show stale fps.
+  const fresh = open && Date.now() - statsStamp < 2500;
   return {
-    open: !!win && !win.isDestroyed(),
+    open,
     displayId,
-    source,
-    // No acks for a while = no frames arriving: don't show a stale figure.
-    fps: Date.now() - lastFpsStamp > 2000 ? 0 : measuredFps,
     displays: listDisplays(),
+    stats: fresh ? stats : { left: EMPTY_DECK_STATS, right: EMPTY_DECK_STATS },
   };
 }
 
@@ -100,25 +87,19 @@ export function openProjector(
   });
   win = w;
   displayId = id;
-  inFlight = false;
-  measuredFps = 0;
+  statsStamp = 0;
 
   w.once('ready-to-show', () => {
     w.show();
     // macOS: "simple" fullscreen covers the display (menu bar included)
-    // without creating a new Space, so there is no slide animation and the
-    // window stays put on the projector.
+    // without creating a new Space, so there is no slide animation.
     if (process.platform === 'darwin') w.setSimpleFullScreen(true);
     else w.setFullScreen(true);
-  });
-  w.webContents.on('did-finish-load', () => {
-    inFlight = false;
   });
   w.on('closed', () => {
     if (win === w) {
       win = null;
       displayId = null;
-      measuredFps = 0;
     }
     onClosed();
   });
@@ -131,20 +112,6 @@ export function closeProjector(): void {
   if (win && !win.isDestroyed()) win.destroy();
   win = null;
   displayId = null;
-  measuredFps = 0;
-}
-
-export function setProjectorSource(next: ProjectorSource): void {
-  source = next;
-  inFlight = false;
-  if (win && !win.isDestroyed()) {
-    win.webContents.send('app:projector-source', source);
-  }
-}
-
-/** The source currently on the projector, or null when it is closed. */
-export function activeProjectorSource(): ProjectorSource | null {
-  return win && !win.isDestroyed() ? source : null;
 }
 
 /** Close the window if its display was unplugged. */
@@ -152,48 +119,15 @@ export function handleDisplayRemoved(id: number): void {
   if (id === displayId) closeProjector();
 }
 
-/**
- * Offer one finished RGBA frame from `from`. Ignored unless the projector is
- * open and showing that source, and dropped while the previous one is drawing.
- */
-export function projectFrame(
-  from: ProjectorSource,
-  rgba: Uint8Array,
-  width: number,
-  height: number,
-): void {
-  if (from !== source || !win || win.isDestroyed()) return;
-  const now = Date.now();
-  if (inFlight && now - inFlightSince < ACK_TIMEOUT_MS) return;
-  inFlight = true;
-  inFlightSince = now;
-  // send() serialises (copies) synchronously, so the caller may reuse rgba.
-  const t = performance.now();
-  win.webContents.send('app:projector-frame', {
-    data: rgba.subarray(0, width * height * 4),
-    width,
-    height,
-  });
-  perfAdd('proj.send', performance.now() - t);
+export function sendProjectorState(state: ProjectorState): void {
+  const wc = projectorContents();
+  if (wc) wc.send('app:projector-state', state);
 }
 
-/** The window finished drawing the last frame. Returns true once per second
- * when the fps figure changed (so the caller can push a status update). */
-export function projectorFrameDone(): boolean {
-  inFlight = false;
-  framesThisSecond++;
-  const now = Date.now();
-  if (now - lastFpsStamp >= 1000) {
-    const changed = measuredFps !== framesThisSecond;
-    measuredFps = framesThisSecond;
-    framesThisSecond = 0;
-    lastFpsStamp = now;
-    return changed;
-  }
-  return false;
-}
-
-/** Forward generative params so a 'gen' projector stays in sync. */
-export function sendToProjector(channel: string, payload: unknown): void {
-  if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+/** Store the figures the window reports. True when they changed. */
+export function setProjectorStats(next: ProjectorStats): boolean {
+  statsStamp = Date.now();
+  const changed = JSON.stringify(next) !== JSON.stringify(stats);
+  stats = next;
+  return changed;
 }

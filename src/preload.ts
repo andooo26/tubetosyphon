@@ -1,184 +1,63 @@
 import { contextBridge, ipcRenderer, clipboard } from 'electron';
-import type { GenParams } from './gen/params';
 import type { LoginState } from './login';
-import type { OutputProtocol } from './output';
 import type {
-  DisplayInfo,
-  ProjectorSource,
-  ProjectorStatus,
-} from './projector';
+  AppStatus,
+  ChannelId,
+  OutputSettings,
+  ProjectorState,
+  ProjectorStats,
+  Quality,
+} from './shared';
 
-export type {
-  DisplayInfo,
-  LoginState,
-  OutputProtocol,
-  ProjectorSource,
-  ProjectorStatus,
-};
+export type { LoginState };
 
-/** One finished RGBA frame for the projector window (A / B / VJ sources). */
-export interface ProjectorFrame {
-  data: Uint8Array;
-  width: number;
-  height: number;
-}
+type Result = Promise<{ ok: boolean; error?: string }>;
 
-export type ChannelId = 'left' | 'right';
-
-// YouTube playback-quality target. 'auto' lets YouTube's ABR decide; 'highest'
-// forces the best available; the rest are YouTube's own quality-level ids and
-// mean "best available at or below this level".
-export type Quality =
-  | 'auto'
-  | 'highest'
-  | 'hd2160'
-  | 'hd1440'
-  | 'hd1080'
-  | 'hd720'
-  | 'large'
-  | 'medium';
-
-export interface ChannelStatus {
-  running: boolean;
-  capturing: boolean;
-  hasClients: boolean | null; // null = protocol can't tell (Spout)
-  fps: number;
-  captureFps: number; // frames delivered by the page capture per second
-  frameMs: number; // avg main-thread ms to process one captured frame
-  serverName: string;
-  error: string | null;
-  testFrame: boolean;
-  hideControls: boolean;
-  quality: Quality;
-}
-
-/**
- * How the two players are routed: two Syphon servers, or one crossfaded server.
- * The 汎用 (generative) output is NOT a mode — it is an independent third
- * server that can run alongside either routing.
- */
-export type Mode = 'dual' | 'vj';
-
-export interface VjStatus {
-  running: boolean;
-  hasClients: boolean | null;
-  fps: number;
-  serverName: string;
-  error: string | null;
-}
-
-/** Same shape as VjStatus — the single generative Syphon output. */
-export type GenStatus = VjStatus;
-
-export interface AppStatus {
-  left: ChannelStatus;
-  right: ChannelStatus;
-  protocol: OutputProtocol; // Syphon on macOS, Spout on Windows
-  projector: ProjectorStatus;
-  mode: Mode;
-  vjAlpha: number; // 0 = A (left), 1 = B (right)
-  vj: VjStatus;
-  gen: GenStatus;
-  genParams: GenParams;
+function subscribe<T>(channel: string, cb: (v: T) => void): () => void {
+  const listener = (_e: unknown, v: T) => cb(v);
+  ipcRenderer.on(channel, listener);
+  return () => {
+    ipcRenderer.removeListener(channel, listener);
+  };
 }
 
 const api = {
-  registerGuest: (
-    channel: ChannelId,
-    contentsId: number,
-  ): Promise<{ ok: boolean }> =>
+  // ---- Control UI ----
+  registerGuest: (channel: ChannelId, contentsId: number): Result =>
     ipcRenderer.invoke('app:register-guest', channel, contentsId),
-  startOutput: (channel: ChannelId): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('app:start-output', channel),
-  stopOutput: (channel: ChannelId): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('app:stop-output', channel),
-  testFrame: (
-    channel: ChannelId,
-    on: boolean,
-  ): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('app:test-frame', channel, on),
-  setHideControls: (
-    channel: ChannelId,
-    on: boolean,
-  ): Promise<{ ok: boolean; error?: string }> =>
+  setHideControls: (channel: ChannelId, on: boolean): Result =>
     ipcRenderer.invoke('app:set-hide-controls', channel, on),
-  setQuality: (
-    channel: ChannelId,
-    quality: Quality,
-  ): Promise<{ ok: boolean; error?: string }> =>
+  setQuality: (channel: ChannelId, quality: Quality): Result =>
     ipcRenderer.invoke('app:set-quality', channel, quality),
-  setMode: (mode: Mode): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('app:set-mode', mode),
-  setVjAlpha: (alpha: number): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('app:set-vj-alpha', alpha),
-  fadeVjTo: (
-    target: number,
-    durationMs: number,
-  ): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('app:vj-fade', target, durationMs),
-  setGenOutput: (on: boolean): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('app:set-gen-output', on),
-  setGenParams: (
-    patch: Partial<GenParams>,
-  ): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('app:set-gen-params', patch),
-  /** Params pushed to the offscreen generative window (and back to the UI). */
-  onGenParams: (cb: (p: GenParams) => void): (() => void) => {
-    const listener = (_e: unknown, p: GenParams) => cb(p);
-    ipcRenderer.on('app:gen-params', listener);
-    return () => {
-      ipcRenderer.removeListener('app:gen-params', listener);
-    };
-  },
+  setAlpha: (alpha: number): Result => ipcRenderer.invoke('app:set-alpha', alpha),
+  fadeTo: (target: number, durationMs: number): Result =>
+    ipcRenderer.invoke('app:fade', target, durationMs),
+  setOutput: (patch: Partial<OutputSettings>): Result =>
+    ipcRenderer.invoke('app:set-output', patch),
   getStatus: (): Promise<AppStatus> => ipcRenderer.invoke('app:get-status'),
-  onStatus: (cb: (s: AppStatus) => void): (() => void) => {
-    const listener = (_e: unknown, s: AppStatus) => cb(s);
-    ipcRenderer.on('app:status', listener);
-    return () => {
-      ipcRenderer.removeListener('app:status', listener);
-    };
-  },
+  onStatus: (cb: (s: AppStatus) => void) => subscribe('app:status', cb),
   readClipboard: (): string => clipboard.readText(),
   /** Open the dedicated Google login window (shared player session). */
-  googleLogin: (): Promise<{ ok: boolean }> =>
-    ipcRenderer.invoke('app:google-login'),
-  googleLogout: (): Promise<LoginState> =>
-    ipcRenderer.invoke('app:google-logout'),
-  getLoginState: (): Promise<LoginState> =>
-    ipcRenderer.invoke('app:get-login-state'),
-  onLoginState: (cb: (s: LoginState) => void): (() => void) => {
-    const listener = (_e: unknown, s: LoginState) => cb(s);
-    ipcRenderer.on('app:login-state', listener);
-    return () => {
-      ipcRenderer.removeListener('app:login-state', listener);
-    };
-  },
+  googleLogin: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('app:google-login'),
+  googleLogout: (): Promise<LoginState> => ipcRenderer.invoke('app:google-logout'),
+  getLoginState: (): Promise<LoginState> => ipcRenderer.invoke('app:get-login-state'),
+  onLoginState: (cb: (s: LoginState) => void) => subscribe('app:login-state', cb),
   /** Open the fullscreen projector window on a display (moves it if open). */
-  openProjector: (displayId: number): Promise<{ ok: boolean; error?: string }> =>
+  openProjector: (displayId: number): Result =>
     ipcRenderer.invoke('app:projector-open', displayId),
   closeProjector: (): Promise<{ ok: boolean }> =>
     ipcRenderer.invoke('app:projector-close'),
-  setProjectorSource: (
-    source: ProjectorSource,
-  ): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('app:projector-set-source', source),
+
   // ---- Used by the projector window itself ----
-  onProjectorSource: (cb: (s: ProjectorSource) => void): (() => void) => {
-    const listener = (_e: unknown, s: ProjectorSource) => cb(s);
-    ipcRenderer.on('app:projector-source', listener);
-    return () => {
-      ipcRenderer.removeListener('app:projector-source', listener);
-    };
-  },
-  onProjectorFrame: (cb: (f: ProjectorFrame) => void): (() => void) => {
-    const listener = (_e: unknown, f: ProjectorFrame) => cb(f);
-    ipcRenderer.on('app:projector-frame', listener);
-    return () => {
-      ipcRenderer.removeListener('app:projector-frame', listener);
-    };
-  },
-  /** Ack: the last frame is drawn, main may send the next one. */
-  projectorFrameDone: (): void => ipcRenderer.send('app:projector-frame-done'),
+  getProjectorState: (): Promise<ProjectorState> =>
+    ipcRenderer.invoke('app:projector-get-state'),
+  onProjectorState: (cb: (s: ProjectorState) => void) =>
+    subscribe('app:projector-state', cb),
+  /** One-shot tab-capture id for a deck's player (null if it has none). */
+  getDeckSourceId: (channel: ChannelId): Promise<string | null> =>
+    ipcRenderer.invoke('app:projector-source-id', channel),
+  reportProjectorStats: (stats: ProjectorStats): void =>
+    ipcRenderer.send('app:projector-stats', stats),
 };
 
 contextBridge.exposeInMainWorld('api', api);

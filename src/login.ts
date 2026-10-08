@@ -1,5 +1,5 @@
 import { BrowserWindow, session, type Session } from 'electron';
-import { PLAYER_PARTITION } from './constants';
+import { PLAYER_PARTITION } from './shared';
 
 // ---- Google login (for YouTube Premium) -----------------------------------
 // Google refuses sign-in from embedded browsers ("This browser or app may not

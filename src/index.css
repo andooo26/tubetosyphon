@@ -82,8 +82,7 @@ body {
 /* ---- Typographic primitives ---- */
 
 .num,
-.transport .time,
-.genrow .bpm {
+.transport .time {
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.01em;
@@ -106,21 +105,7 @@ body {
   gap: 14px;
 }
 
-/* Joined segmented control — one control, not three loose buttons. */
-.vjbar .modes .segmented {
-  display: flex;
-}
-
-.vjbar .modes .segmented button {
-  border-right-width: 0;
-}
-
-.vjbar .modes .segmented button:last-child {
-  border-right-width: 1px;
-}
-
-/* Right-hand group in the rail: the generative output, which is independent of
-   the player routing and so must stay visible and operable from any view. */
+/* Right-hand group in the rail: projector, output settings, account. */
 .vjbar .modes .railgroup {
   margin-left: auto;
   display: flex;
@@ -146,7 +131,7 @@ body {
   padding: 0;
 }
 
-/* Account control, after the generative group at the far right of the rail. */
+/* Account control at the far right of the rail. */
 .vjbar .modes .logingroup {
   display: flex;
   align-items: center;
@@ -309,8 +294,7 @@ button.danger:hover:not(:disabled) {
   color: var(--ink-dim);
 }
 
-.quality select,
-.genrow .bpm {
+.quality select {
   padding: 6px 8px;
   border: 1px solid var(--rule-strong);
   border-radius: 0;
@@ -343,8 +327,7 @@ button.danger:hover:not(:disabled) {
   background-color: #1c1c1f;
 }
 
-.quality select:focus,
-.genrow .bpm:focus {
+.quality select:focus {
   outline: none;
   border-color: var(--acid);
 }
@@ -408,8 +391,8 @@ input[type='range']:disabled::-webkit-slider-thumb {
   font-weight: 600;
 }
 
-/* In VJ mode the deck letter is the channel's whole identity, so it is set at
-   display size rather than as another status word. */
+/* The deck letter is the channel's whole identity, so it is set at display
+   size rather than as another status word. */
 .chanid {
   font-size: 15px;
   letter-spacing: 0.12em;
@@ -508,119 +491,10 @@ input[type='range']:disabled::-webkit-slider-thumb {
   min-width: 140px;
 }
 
-/* ---- 汎用 (generative) mode ---- */
-
-.genpanel {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  gap: 28px;
-  padding: 22px var(--gutter);
-  background: var(--stock);
-}
-
-.gencontrols {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  width: 340px;
-  flex: none;
-  padding-right: 26px;
-  border-right: 1px solid var(--rule);
-}
-
-.gencontrols .statusline {
-  padding-left: 0;
-}
-
-.genrow {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-/* The one place a number is allowed to be big: the tempo. */
-.genrow .bpm {
-  width: 92px;
-  font-size: 15px;
-  padding: 7px 8px;
-}
-
-.genrow .bpm::-webkit-inner-spin-button {
-  opacity: 0.35;
-}
-
-.quality.slider {
-  flex: 1;
-  min-width: 100%;
-  gap: 12px;
-  justify-content: space-between;
-}
-
-.quality.slider input[type='range'] {
-  flex: 1;
-  max-width: 210px;
-}
-
-.genpreview {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 8px;
-}
-
-/* The preview takes whatever room the window gives it, capped by height so the
-   16:9 frame never pushes its own caption off screen. */
-.genthumb {
-  flex: 1 1 auto;
-  min-height: 0;
-  width: auto;
-  max-width: 100%;
-  aspect-ratio: 16 / 9;
-  background: #000;
-  border: 1px solid var(--rule);
-  display: block;
-}
-
-.genhint {
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--ink-faint);
-}
-
-/* Section heading inside the control column. */
-.genhead {
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 0.2em;
-  text-transform: uppercase;
-  color: var(--ink-faint);
-  border-bottom: 1px solid var(--rule);
-  padding-bottom: 7px;
-}
-
-/* The offscreen output window (index.html?gen=1): canvas only, no chrome. */
-.genstage {
-  width: 100vw;
-  height: 100vh;
-  background: #000;
-  overflow: hidden;
-}
-
-.genfull {
-  width: 100vw;
-  height: 100vh;
-  display: block;
-}
-
 /* ---- Projector window ---- */
 
 .projstage {
+  position: relative;
   width: 100vw;
   height: 100vh;
   background: #000;
@@ -628,16 +502,23 @@ input[type='range']:disabled::-webkit-slider-thumb {
   cursor: none;
 }
 
-.projcanvas {
-  width: 100vw;
-  height: 100vh;
-  display: block;
+/* One full-window layer per deck; B is stacked over A and its opacity is the
+   crossfade. The black layer background is what a non-live deck shows. */
+.projdeck {
+  position: absolute;
+  inset: 0;
+  background: #000;
 }
 
-/* Generative source: same 1920x1080 canvas as the output, fitted to the display. */
-.projgen {
-  width: 100vw;
-  height: 100vh;
+/* Box of the drawn-video region, contain-fitted; clips the rest of the
+   captured viewport. Geometry is set from JS (layoutDeck). */
+.projclip {
+  position: absolute;
+  overflow: hidden;
+}
+
+.projclip video {
+  position: absolute;
   display: block;
-  object-fit: contain;
+  object-fit: fill;
 }

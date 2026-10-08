@@ -1,22 +1,16 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type {
-  AppStatus,
-  ChannelId,
-  ChannelStatus,
-  LoginState,
-  Mode,
-  ProjectorSource,
-  Quality,
-} from './preload';
-import { GenCanvas } from './GenView';
-import { PLAYER_PARTITION } from './constants';
+import type { LoginState } from './preload';
 import {
-  DEFAULT_GEN_PARAMS,
-  GENRES,
-  MAX_BPM,
-  MIN_BPM,
-  type Genre,
-} from './gen/params';
+  DEFAULT_OUTPUT,
+  EMPTY_DECK_STATS,
+  PLAYER_PARTITION,
+  type AppStatus,
+  type ChannelId,
+  type DeckStats,
+  type DeckStatus,
+  type OutputSettings,
+  type Quality,
+} from './shared';
 
 /** True if the input looks like a URL (has a scheme or a bare domain), rather
  * than a free-text search query. */
@@ -58,18 +52,10 @@ const DESKTOP_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
-const EMPTY_CHANNEL: ChannelStatus = {
-  running: false,
-  capturing: false,
-  hasClients: false,
-  fps: 0,
-  captureFps: 0,
-  frameMs: 0,
-  serverName: '',
-  error: null,
-  testFrame: false,
+const EMPTY_DECK: DeckStatus = {
+  live: false,
   hideControls: true,
-  quality: 'highest',
+  quality: 'hd1080',
 };
 
 // UI label -> YouTube quality target (see Quality in preload).
@@ -85,33 +71,17 @@ const QUALITY_OPTIONS: { value: Quality; label: string }[] = [
 ];
 
 const EMPTY_STATUS: AppStatus = {
-  left: EMPTY_CHANNEL,
-  right: EMPTY_CHANNEL,
-  protocol: 'Syphon',
+  left: EMPTY_DECK,
+  right: EMPTY_DECK,
+  alpha: 0,
+  fading: false,
   projector: {
     open: false,
     displayId: null,
-    source: 'left',
-    fps: 0,
     displays: [],
+    stats: { left: EMPTY_DECK_STATS, right: EMPTY_DECK_STATS },
   },
-  mode: 'dual',
-  vjAlpha: 0,
-  vj: {
-    running: false,
-    hasClients: false,
-    fps: 0,
-    serverName: 'TubeToSyphon',
-    error: null,
-  },
-  gen: {
-    running: false,
-    hasClients: false,
-    fps: 0,
-    serverName: 'TubeToSyphon-GEN',
-    error: null,
-  },
-  genParams: DEFAULT_GEN_PARAMS,
+  output: DEFAULT_OUTPUT,
 };
 
 // mm:ss (or h:mm:ss) for the transport time labels.
@@ -133,20 +103,16 @@ interface VideoState {
   maxH: number; // max available resolution height (from YouTube quality levels)
 }
 
-/** "connected" / "no receiver"; nothing when the protocol can't tell (Spout). */
-function ReceiverState({ hasClients }: { hasClients: boolean | null }) {
-  if (hasClients === null) return null;
-  return <span>· {hasClients ? 'connected' : 'no receiver'}</span>;
-}
-
 function Player({
   channel,
   status,
-  vjMode,
+  proj,
+  projecting,
 }: {
   channel: ChannelId;
-  status: ChannelStatus;
-  vjMode: boolean;
+  status: DeckStatus;
+  proj: DeckStats;
+  projecting: boolean;
 }) {
   const [input, setInput] = useState('');
   const [loadedUrl, setLoadedUrl] = useState('');
@@ -178,7 +144,7 @@ function Player({
     }
   };
 
-  // Register this webview's contentsId with main so it can capture + inject CSS.
+  // Register this webview's contentsId with main (page treatment + capture).
   useEffect(() => {
     const wv = webviewRef.current;
     if (!wv) return;
@@ -230,7 +196,7 @@ function Player({
       attached = false;
     }
     if (attached && typeof wv.loadURL === 'function') {
-      wv.loadURL(url).catch(() => {});
+      wv.loadURL(url).catch((): void => undefined);
     } else {
       wv.src = url; // initial load before the guest webContents exists
     }
@@ -257,13 +223,6 @@ function Player({
       goBack?: () => void;
     } | null;
     if (wv && wv.canGoBack?.()) wv.goBack?.();
-  };
-
-  const toggleOutput = async () => {
-    const res = status.running
-      ? await window.api.stopOutput(channel)
-      : await window.api.startOutput(channel);
-    if (!res.ok && res.error) alert(res.error);
   };
 
   const changeQuality = async (q: Quality) => {
@@ -316,14 +275,6 @@ function Player({
       </header>
 
       <div className="bar sub">
-        {!vjMode && (
-          <button
-            className={status.running ? 'danger' : 'primary'}
-            onClick={toggleOutput}
-          >
-            {status.running ? 'Stop output' : 'Start output'}
-          </button>
-        )}
         <button onClick={toggleHideControls}>
           {status.hideControls ? 'Chrome: off' : 'Chrome: on'}
         </button>
@@ -342,32 +293,28 @@ function Player({
         </label>
         <div className="spacer" />
         <div className="statusline">
-          {vjMode ? (
-            <b className="chanid">{channel === 'left' ? 'A' : 'B'}</b>
-          ) : (
-            <>
-              <span className={`dot ${status.running ? 'on' : 'off'}`} />
-              <b>{status.serverName}</b>
-            </>
-          )}
+          <b className="chanid">{channel === 'left' ? 'A' : 'B'}</b>
           {video.vh > 0 && (
             <span title="current resolution / this video's max resolution">
               · {video.vh}p / {video.maxH > 0 ? `${video.maxH}p` : '—'}
             </span>
           )}
-          {!vjMode && (
-            <>
-              <span
-                title={`capture ${status.captureFps}/s · ${status.frameMs} ms/frame`}
-              >
-                · {status.fps} fps
-              </span>
-              <ReceiverState hasClients={status.hasClients} />
-            </>
+          {projecting && (
+            <span
+              title={
+                proj.width
+                  ? `projector capture ${proj.width}×${proj.height}`
+                  : 'projector capture'
+              }
+            >
+              · {status.live ? `out ${proj.fps} fps` : 'out black'}
+            </span>
           )}
         </div>
       </div>
-      {status.error && <div className="statusline error">{status.error}</div>}
+      {projecting && proj.error && (
+        <div className="statusline error">{proj.error}</div>
+      )}
 
       <div className="stage">
         <webview
@@ -381,7 +328,6 @@ function Player({
           <div className="placeholder">
             <span>No source · {channel === 'left' ? 'A' : 'B'}</span>
             <span>Search, paste a URL, or browse YouTube</span>
-            <span>1920×1080 → {status.serverName}</span>
           </div>
         )}
       </div>
@@ -484,16 +430,9 @@ function LoginControl() {
   );
 }
 
-const PROJECTOR_SOURCES: { value: ProjectorSource; label: string }[] = [
-  { value: 'left', label: 'A' },
-  { value: 'right', label: 'B' },
-  { value: 'vj', label: 'VJ mix' },
-  { value: 'gen', label: '汎用' },
-];
-
 /**
- * Projector: pick a display and which output to show on it, then open a
- * fullscreen window there. Shows the same picture as the Syphon/Spout output.
+ * Projector: pick a display and open a fullscreen output window there. It
+ * shows the A/B crossfade; nothing else is needed to get a picture out.
  */
 function ProjectorControl({ status }: { status: AppStatus }) {
   const proj = status.projector;
@@ -523,7 +462,6 @@ function ProjectorControl({ status }: { status: AppStatus }) {
     if (proj.open) open(id);
   };
 
-
   return (
     <div className="projgroup">
       <label className="quality">
@@ -541,325 +479,130 @@ function ProjectorControl({ status }: { status: AppStatus }) {
           ))}
         </select>
       </label>
-      <label className="quality">
-        Source
-        <select
-          value={proj.source}
-          onChange={(e) =>
-            window.api.setProjectorSource(e.target.value as ProjectorSource)
-          }
-        >
-          {PROJECTOR_SOURCES.map((o) => (
-            <option key={o.value} value={o.value}>
-              {o.label}
-            </option>
-          ))}
-        </select>
-      </label>
       <button
-        className={proj.open ? 'danger' : ''}
+        className={proj.open ? 'danger' : 'primary'}
         onClick={() => (proj.open ? window.api.closeProjector() : open(displayId))}
         disabled={!proj.open && displayId == null}
         title="選んだディスプレイに全画面で出力（投影ウィンドウで Esc でも閉じる）"
       >
         {proj.open ? 'Stop proj' : 'Project'}
       </button>
-      {proj.open && (
-        <div className="statusline">
-          <span className="dot on" />
-          {/* 汎用 is drawn inside the projector window, so there is no feed to count. */}
-          <span>{proj.source === 'gen' ? 'live' : `${proj.fps} fps`}</span>
-        </div>
-      )}
+      <div className="statusline">
+        <span className={`dot ${proj.open ? 'on' : 'off'}`} />
+        <span>{proj.open ? 'live' : 'off'}</span>
+      </div>
     </div>
   );
 }
 
-// VJ crossfade + mode toggle bar. In VJ mode the two players feed one Syphon
-// output ("TubeToSyphon") blended by the A/B fader; Cut A/B jump to either end.
-function VjBar({
-  status,
-  view,
-  setView,
-}: {
-  status: AppStatus;
-  view: View;
-  setView: (v: View) => void;
-}) {
-  const vjMode = status.mode === 'vj';
-  const vj = status.vj;
-  const gen = status.gen;
+/** Capture size / rate of the projected decks — the knob for weak PCs. */
+function OutputControl({ output }: { output: OutputSettings }) {
+  const set = (patch: Partial<OutputSettings>) => window.api.setOutput(patch);
+  return (
+    <div className="projgroup">
+      <label
+        className="quality"
+        title="投影の解像度。重いときは 720p に下げる"
+      >
+        Res
+        <select
+          value={output.height}
+          onChange={(e) =>
+            set({ height: Number(e.target.value) as OutputSettings['height'] })
+          }
+        >
+          <option value={1080}>1080p</option>
+          <option value={720}>720p</option>
+        </select>
+      </label>
+      <label
+        className="quality"
+        title="投影のフレームレート。重いときは 30 に下げる"
+      >
+        FPS
+        <select
+          value={output.fps}
+          onChange={(e) =>
+            set({ fps: Number(e.target.value) as OutputSettings['fps'] })
+          }
+        >
+          <option value={60}>60</option>
+          <option value={30}>30</option>
+        </select>
+      </label>
+    </div>
+  );
+}
 
-  const toggleGen = async () => {
-    const res = await window.api.setGenOutput(!gen.running);
-    if (!res.ok && res.error) alert(res.error);
-  };
-
-  const setMode = async (mode: Mode) => {
-    const res = await window.api.setMode(mode);
-    if (!res.ok && res.error) alert(res.error);
-  };
-  const setAlpha = (a: number) => window.api.setVjAlpha(a);
-  const fadeTo = (a: number) => window.api.fadeVjTo(a, 1000); // ~1s crossfade
+// Top rail: identity, projector, output settings, account; then the A/B fader.
+function VjBar({ status }: { status: AppStatus }) {
+  const setAlpha = (a: number) => window.api.setAlpha(a);
+  const fadeTo = (a: number) => window.api.fadeTo(a, 1000); // ~1s crossfade
 
   return (
     <div className="vjbar">
       <div className="modes">
-        <span className="wordmark">Tube to Syphon</span>
-        <div className="segmented">
-          <button
-            className={status.mode === 'dual' ? 'primary' : ''}
-            onClick={() => setMode('dual')}
-            title={`2つのプレイヤーを2系統の${status.protocol}へ`}
-          >
-            Dual
-          </button>
-          <button
-            className={vjMode ? 'primary' : ''}
-            onClick={() => setMode('vj')}
-            title="2つのプレイヤーをクロスフェードして1系統へ"
-          >
-            VJ
-          </button>
-        </div>
-        <span className="wordmark">
-          {vjMode ? 'players → 1 · crossfade' : 'players → 2'}
-        </span>
-
-        {/* The generative output is its own Syphon server, independent of the
-            player routing — Dual + 汎用 publishes three sources at once. So it
-            gets its own group, and stays reachable from either view. */}
+        <span className="wordmark">Tube VJ</span>
+        <span className="wordmark">A / B → projector</span>
         <div className="railgroup">
-          <button
-            className={view === 'gen' ? 'primary' : ''}
-            onClick={() => setView(view === 'gen' ? 'players' : 'gen')}
-            title="汎用グラフィックスの操作パネルを開閉（出力の入切とは別）"
-          >
-            汎用
-          </button>
-          <button
-            className={gen.running ? 'danger' : ''}
-            onClick={toggleGen}
-            title={`汎用グラフィックスを独立した${status.protocol}ソースとして出力`}
-          >
-            {gen.running ? 'Stop gen' : 'Start gen'}
-          </button>
-          <div className="statusline">
-            <span className={`dot ${gen.running ? 'on' : 'off'}`} />
-            <b>{gen.serverName}</b>
-            {gen.running && <span>· {gen.fps} fps</span>}
-          </div>
+          <ProjectorControl status={status} />
+          <OutputControl output={status.output} />
+          <LoginControl />
         </div>
-        <ProjectorControl status={status} />
-        <LoginControl />
       </div>
 
-      {/* The fader also drives the projector's VJ mix in Dual mode (the mix is
-          then shown only on the projector, not published). */}
-      {(vjMode || status.projector.source === 'vj') && (
-        <div className="vjfade">
-          <button onClick={() => fadeTo(0)} title="Fade to A over ~1s">
-            Fade→A
-          </button>
-          <span className="ab">A</span>
-          <input
-            className="fader"
-            type="range"
-            min={0}
-            max={1}
-            step={0.001}
-            value={status.vjAlpha}
-            onChange={(e) => setAlpha(Number(e.target.value))}
-          />
-          <span className="ab">B</span>
-          <button onClick={() => fadeTo(1)} title="Fade to B over ~1s">
-            Fade→B
-          </button>
-          {vjMode ? (
-            <div className="statusline">
-              <span className={`dot ${vj.running ? 'on' : 'off'}`} />
-              <b>{vj.serverName}</b>
-              <span>· {vj.fps} fps</span>
-              <ReceiverState hasClients={vj.hasClients} />
-            </div>
-          ) : (
-            <div className="statusline">
-              <span className={`dot ${status.projector.open ? 'on' : 'off'}`} />
-              <b>Projector only</b>
-            </div>
-          )}
-        </div>
-      )}
-      {vjMode && vj.error && (
-        <div className="statusline error">{vj.error}</div>
-      )}
-    </div>
-  );
-}
-
-/**
- * 汎用 (generic) mode panel: the musical clock + look controls, and a live
- * preview of exactly the frame the offscreen window is publishing to Syphon.
- */
-function GenPanel({ status }: { status: AppStatus }) {
-  const p = status.genParams;
-  const gen = status.gen;
-  // Tap-tempo timestamps (most recent last). Kept in a ref — taps don't need to
-  // re-render anything by themselves.
-  const taps = useRef<number[]>([]);
-
-  const patch = (next: Partial<typeof p>) => window.api.setGenParams(next);
-
-  const tap = () => {
-    const now = Date.now();
-    // A gap longer than 2s starts a new measurement.
-    if (taps.current.length && now - taps.current[taps.current.length - 1] > 2000) {
-      taps.current = [];
-    }
-    taps.current.push(now);
-    if (taps.current.length > 5) taps.current.shift();
-    if (taps.current.length >= 2) {
-      const first = taps.current[0];
-      const spans = taps.current.length - 1;
-      const bpm = 60000 / ((now - first) / spans);
-      // The last tap is a beat, so anchor the grid to it as well.
-      patch({ bpm: Math.round(bpm * 10) / 10, beatEpoch: now });
-    } else {
-      patch({ beatEpoch: now });
-    }
-  };
-
-  const changeGenre = (genre: Genre) => {
-    // Adopt the genre's typical tempo so the preset lands in a sensible range.
-    const preset = GENRES.find((g) => g.value === genre);
-    patch({ genre, bpm: preset?.bpm ?? p.bpm });
-  };
-
-  return (
-    <div className="genpanel">
-      <div className="gencontrols">
-        <div className="genhead">Clock</div>
-        <div className="genrow">
-          <label className="quality">
-            Genre
-            <select
-              value={p.genre}
-              onChange={(e) => changeGenre(e.target.value as Genre)}
-            >
-              {GENRES.map((g) => (
-                <option key={g.value} value={g.value}>
-                  {g.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="quality">
-            BPM
-            <input
-              className="bpm"
-              type="number"
-              min={MIN_BPM}
-              max={MAX_BPM}
-              step={0.1}
-              value={p.bpm}
-              onChange={(e) => patch({ bpm: Number(e.target.value) })}
-            />
-          </label>
-          <button onClick={tap} title="Tap 4 times on the beat">
-            Tap
-          </button>
-          <button
-            onClick={() => patch({ beatEpoch: Date.now() })}
-            title="Re-align the beat grid to right now"
-          >
-            Sync
-          </button>
-        </div>
-
-        <div className="genhead">Look</div>
-        <div className="genrow">
-          <button
-            onClick={() => patch({ seed: Math.floor(Math.random() * 100000) })}
-            title="構図・配色の乱数を引き直す（8拍ごとの自動変化とは別）"
-          >
-            Shuffle
-          </button>
-          <span className="genhint num">seed {p.seed}</span>
-        </div>
-        <div className="genrow">
-          <label className="quality slider">
-            Intensity
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={p.intensity}
-              onChange={(e) => patch({ intensity: Number(e.target.value) })}
-            />
-          </label>
-          {/* Rotates the preset's spot inks within a safe range rather than
-              sweeping the whole hue wheel, so a palette bends but never breaks. */}
-          <label className="quality slider">
-            Tint
-            <input
-              type="range"
-              min={0}
-              max={359}
-              step={1}
-              value={p.hue}
-              onChange={(e) => patch({ hue: Number(e.target.value) })}
-            />
-          </label>
-        </div>
-
+      <div className="vjfade">
+        <button onClick={() => fadeTo(0)} title="Fade to A over ~1s">
+          Fade→A
+        </button>
+        <span className="ab">A</span>
+        <input
+          className="fader"
+          type="range"
+          min={0}
+          max={1}
+          step={0.001}
+          value={status.alpha}
+          onChange={(e) => setAlpha(Number(e.target.value))}
+        />
+        <span className="ab">B</span>
+        <button onClick={() => fadeTo(1)} title="Fade to B over ~1s">
+          Fade→B
+        </button>
         <div className="statusline">
-          <span className={`dot ${gen.running ? 'on' : 'off'}`} />
-          <b>{gen.serverName}</b>
-          <span>· {gen.fps} fps</span>
-          <ReceiverState hasClients={gen.hasClients} />
-          <span>· 1920×1080</span>
+          <span className="num">{Math.round(status.alpha * 100)}%</span>
         </div>
-        {gen.error && <div className="statusline error">{gen.error}</div>}
-      </div>
-
-      <div className="genpreview">
-        {/* 720p backing store: the preview is displayed large, and at 640×360 the
-            type and hairlines in the sketch visibly softened when scaled up. */}
-        <GenCanvas params={p} width={1280} height={720} className="genthumb" />
-        <div className="genhint">Live preview · identical to the {status.protocol} output</div>
       </div>
     </div>
   );
 }
-
-/** Which workspace is on screen. Purely a view — it starts and stops nothing. */
-type View = 'players' | 'gen';
 
 export default function App() {
   const [status, setStatus] = useState<AppStatus>(EMPTY_STATUS);
-  const [view, setView] = useState<View>('players');
 
   useEffect(() => {
     window.api.getStatus().then(setStatus);
-    const off = window.api.onStatus(setStatus);
-    return off;
+    return window.api.onStatus(setStatus);
   }, []);
 
-  const vjMode = status.mode === 'vj';
-  const genView = view === 'gen';
-
+  const projecting = status.projector.open;
   return (
     <div className="app">
-      <VjBar status={status} view={view} setView={setView} />
-      {genView && <GenPanel status={status} />}
-      {/* Kept mounted but hidden while the generative panel is up: unmounting
-          would destroy the <webview>s and lose whatever the user had loaded.
-          The players keep publishing to Syphon either way. */}
-      <div className="players" style={genView ? { display: 'none' } : undefined}>
-        <Player channel="left" status={status.left} vjMode={vjMode} />
+      <VjBar status={status} />
+      <div className="players">
+        <Player
+          channel="left"
+          status={status.left}
+          proj={status.projector.stats.left}
+          projecting={projecting}
+        />
         <div className="divider" />
-        <Player channel="right" status={status.right} vjMode={vjMode} />
+        <Player
+          channel="right"
+          status={status.right}
+          proj={status.projector.stats.right}
+          projecting={projecting}
+        />
       </div>
     </div>
   );
