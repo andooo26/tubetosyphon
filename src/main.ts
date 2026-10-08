@@ -239,9 +239,18 @@ function loadC() {
   }
   // The beat grid starts now (the stored epoch is from a previous session).
   c.gen = { ...c.gen, beatEpoch: Date.now() };
+  // Benchmark: U2S_BENCH_CLIP=<file> plays that file on deck C.
+  const benchClip = process.env.U2S_BENCH && process.env.U2S_BENCH_CLIP;
+  const clip = benchClip ? makeClip(benchClip) : null;
+  if (clip) {
+    c.clips = [clip];
+    c.clipId = clip.id;
+    c.source = 'file';
+  }
 }
 
 function saveC() {
+  if (process.env.U2S_BENCH) return; // never persist a benchmark's settings
   const data = {
     source: c.source,
     blend: c.blend,

@@ -11,7 +11,9 @@ import type { ProjectorStats } from './shared';
 // Optional: U2S_BENCH_ALPHA (default 0.5), U2S_BENCH_PROJECTOR=0 to skip it,
 // U2S_BENCH_URLS="<A url> <B url>" to load real pages (e.g. YouTube watch
 // URLs) instead of the synthetic one, U2S_BENCH_SHOT=<dir> to save PNGs of the
-// projector and the control window at the end (to eyeball crop and mix).
+// projector and the control window at the end (to eyeball crop and mix),
+// U2S_BENCH_C=<0..1> to also layer deck C at that opacity (the generative
+// sketch, or the file in U2S_BENCH_CLIP).
 
 // A page that repaints its whole viewport every animation frame.
 const TEST_PAGE =
@@ -37,6 +39,8 @@ const median = (xs: number[]) => {
 export async function runBench(win: BrowserWindow): Promise<void> {
   const seconds = Number(process.env.U2S_BENCH_SECONDS ?? 20);
   const alpha = Number(process.env.U2S_BENCH_ALPHA ?? 0.5);
+  const cOpacity = Number(process.env.U2S_BENCH_C ?? 0);
+  const clip = process.env.U2S_BENCH_CLIP ?? '';
   const useProjector = process.env.U2S_BENCH_PROJECTOR !== '0';
   const primary = screen.getPrimaryDisplay().id;
   const projDisplay =
@@ -68,6 +72,8 @@ export async function runBench(win: BrowserWindow): Promise<void> {
       await r;
     }
     await window.api.setLevel('mix', ${alpha});
+    ${cOpacity > 0 && !clip ? `await window.api.setC({ source: 'gen' });` : ''}
+    ${cOpacity > 0 ? `await window.api.setLevel('c', ${cOpacity});` : ''}
     ${useProjector ? `await window.api.openProjector(${projDisplay});` : ''}
     return true;
   })()`;
@@ -117,6 +123,7 @@ export async function runBench(win: BrowserWindow): Promise<void> {
       scale: d.scaleFactor,
     })),
     alpha,
+    c: cOpacity ? { opacity: cOpacity, source: clip ? 'file' : 'gen' } : null,
     seconds: samples.length,
     projector: useProjector ? { display: projDisplay, left: deck('left'), right: deck('right') } : null,
     lagAvg: median(samples.map((s) => s.lag.avg)),
