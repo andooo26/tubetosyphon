@@ -1,6 +1,7 @@
 # Tube VJ (`windows-vj` branch)
 
-Two YouTube decks (A / B), an A/B crossfader, and a built-in fullscreen
+Two YouTube decks (A / B), an A/B crossfader, a third deck **C** (generative
+graphics or local video/image clips) layered on top, and a built-in fullscreen
 **projector** output. Everything happens inside the app — no Syphon/Spout
 receiver or other VJ software needed. Made to run comfortably on weak Windows
 PCs; it also runs on macOS.
@@ -20,7 +21,16 @@ npm start
    projector, or **Stop proj**, closes it).
 3. Mix with the fader, **Fade→A / Fade→B** (length: **Time**), or **Cut A / B**.
    Keys: **Z** / **X** fade to A / B, **C** cuts to the other side.
-4. If the PC struggles, lower **Res** (720p) and/or **FPS** (30). Deck
+4. **Deck C** (right column) is layered over the A/B mix with its own opacity
+   fader (**In / Out** fade it, key **V** toggles) and a **Blend** mode
+   (Normal / Screen / Add / Multiply / Difference).
+   - **Gen**: the generative sketch from `main`'s 汎用 mode (Genre, BPM, Tap,
+     Sync, Shuffle, Intensity, Tint).
+   - **File**: **+ Add files** (mp4 / mov / webm / png / jpg / gif / webp);
+     click a clip to show it. Videos loop. The list is remembered.
+   - **Preview** shows C small in the window (off by default: it is a second
+     render).
+5. If the PC struggles, lower **Res** (720p) and/or **FPS** (30). Deck
    **Quality** defaults to 1080p (decoding 4K twice is the heaviest thing a weak
    PC can be asked to do). Settings persist.
 
@@ -42,13 +52,18 @@ Now no pixel ever touches JavaScript:
 - Each stream plays in a `<video>`. Cropping to the drawn video (no double
   letterbox) and fitting to the display are plain CSS boxes, and the crossfade
   is B's `opacity` over A — all done by the GPU compositor.
+- Deck C is one more layer: a canvas (generative) or a `<video>`/`<img>`
+  (clips, served over a private `u2s-media://` scheme with Range support), with
+  CSS `opacity` + `mix-blend-mode`. It is unmounted while at 0 %, so a hidden C
+  costs nothing.
 - Main only holds the small shared state (which guests, crop rects measured
   twice a second, fader, settings) and pushes it to the projector on change.
   Fades are animated in the projector per display frame.
 
 Files: `src/main.ts` (state + IPC), `src/projector.ts` (window),
 `src/ProjectorView.tsx` (capture + mix), `src/App.tsx` (control UI),
-`src/youtube.ts` (injected CSS/JS), `src/shared.ts` (types).
+`src/youtube.ts` (injected CSS/JS), `src/media.ts` (clip serving),
+`src/gen/` + `src/GenView.tsx` (generative sketch), `src/shared.ts` (types).
 
 ## Diagnostics
 
@@ -58,7 +73,8 @@ Files: `src/main.ts` (state + IPC), `src/projector.ts` (window),
   fader to 50 %, opens the projector, prints a `U2S_BENCH {…}` summary and
   exits. Options: `U2S_BENCH_SECONDS`, `U2S_BENCH_ALPHA`,
   `U2S_BENCH_URLS="<A> <B>"` (real pages), `U2S_BENCH_SHOT=<dir>` (PNGs of the
-  projector and control window).
+  projector and control window), `U2S_BENCH_C=<0..1>` (layer deck C at that
+  opacity; generative, or `U2S_BENCH_CLIP=<file>`).
 - `U2S_KEEP_VIDEO_OVERLAYS=1` — keep Windows' DirectComposition video overlays
   (disabled by default so captured video updates every frame).
 
