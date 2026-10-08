@@ -154,8 +154,17 @@ function Player({
       ).getWebContentsId?.();
       if (typeof id === 'number') window.api.registerGuest(channel, id);
     };
+    // Navigation from inside the page (or a reload) also counts as a source.
+    const onNavigate = (e: Event) => {
+      const url = (e as Event & { url?: string }).url;
+      if (url && !url.startsWith('about:')) setLoadedUrl(url);
+    };
     wv.addEventListener('dom-ready', onReady);
-    return () => wv.removeEventListener('dom-ready', onReady);
+    wv.addEventListener('did-navigate', onNavigate);
+    return () => {
+      wv.removeEventListener('dom-ready', onReady);
+      wv.removeEventListener('did-navigate', onNavigate);
+    };
   }, [channel]);
 
   // Poll the guest <video> state for the transport bar.
